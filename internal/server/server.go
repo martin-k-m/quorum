@@ -48,6 +48,10 @@ func (c Config) validate() error {
 	return nil
 }
 
+// errNotLeader is returned by Server.Get when this node is not currently the
+// leader — distinct from a completed read that simply found nothing.
+var errNotLeader = errors.New("server: not currently the leader")
+
 type proposeResult struct {
 	applied bool
 	leader  uint64
@@ -63,6 +67,14 @@ type getResult struct {
 	value  []byte
 	found  bool
 	leader uint64
+	// err is set when the read did not actually complete — the read-barrier
+	// entry was never committed (this node lost leadership, or the server
+	// stopped, before it did) — as opposed to a completed read that
+	// genuinely found nothing. found=false with err=nil is a real answer;
+	// found=false with err!=nil is not an answer at all and must not be
+	// treated as one. See pendingEntry's doc for why this distinction is
+	// load-bearing, not cosmetic.
+	err error
 }
 
 type getReq struct {
@@ -244,18 +256,23 @@ func (s *Server) Propose(data []byte) (ok bool, leaderHint uint64, err error) {
 	return r.applied, r.leader, r.err
 }
 
-// Get reads a key from this node's applied state machine. See fsm.FSM.Get
-// for the read-consistency caveat: this is a local read, not a linearizable
-// one.
-func (s *Server) Get(key []byte) (value []byte, found bool, leaderHint uint64) {
+// Get reads a key, linearizably: it blocks behind a read barrier (see the
+// getCh case in loop) that only lets the read proceed once this node has
+// proven, via a real committed log entry, that it is still backed by a
+// majority. It returns an error if that barrier was never committed — this
+// node was not the leader, lost leadership before the barrier committed, or
+// the server stopped — in which case found/value carry no information and
+// must not be treated as an answer; leaderHint, if nonzero, names who to ask
+// instead.
+func (s *Server) Get(key []byte) (value []byte, found bool, leaderHint uint64, err error) {
 	resp := make(chan getResult, 1)
 	select {
 	case s.getCh <- getReq{key: key, resp: resp}:
 	case <-s.stopCh:
-		return nil, false, 0
+		return nil, false, 0, errors.New("server: stopped")
 	}
 	r := <-resp
-	return r.value, r.found, r.leader
+	return r.value, r.found, r.leader, r.err
 }
 
 // --- the event loop: the only goroutine that touches s.node -----------------
@@ -274,22 +291,52 @@ func (s *Server) snapshot() logSnapshot {
 	return logSnapshot{term: s.node.Term(), vote: s.node.VotedFor(), entries: append([]raft.Entry(nil), all[1:]...)}
 }
 
+// pendingEntry is what happens once the log index a Propose or read-barrier
+// Get appended to comes up for application, plus the term that entry was
+// proposed in — the only way to tell a genuine commit of THAT entry apart
+// from a completely different entry that later happens to land at the same
+// index.
+//
+// That distinction is not optional. Raft indices get reused: if this node
+// loses leadership after appending an entry but before it commits (the
+// clearest case is exactly what internal/server's fault-injection tests
+// exercise — an isolated former leader whose uncommitted tail gets truncated
+// and overwritten once it rejoins and hears from the real leader), the index
+// it appended at will eventually be reached again by lastApplied, now
+// holding somebody else's entry entirely. Resolving the original caller's
+// Propose or Get as if THAT commit were theirs — which a pending map keyed
+// on index alone would do — is a real correctness bug: a stranded Put could
+// report success for a write that was actually discarded, or a Get could
+// answer with a value that has no relationship to when it was called. Only
+// resolve as a genuine success when the entry actually found at that index
+// still carries the term it was proposed in.
+type pendingEntry struct {
+	term uint64
+	// resolve is called with applied=true only when the entry that landed at
+	// this index really is the one this caller appended (matching term);
+	// applied=false covers both "the server stopped first" and "a different
+	// entry ended up at this index instead" — from the caller's perspective
+	// both mean the same thing: what they submitted never took effect.
+	resolve func(applied bool)
+}
+
 func (s *Server) loop() {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(s.cfg.TickInterval)
 	defer ticker.Stop()
 
-	// pending maps a proposed entry's log index to the caller waiting on its
-	// commit. Correct because Propose appends exactly one entry per call, so
-	// "the index the leader's log was at before appending, plus one" is
+	// pending maps an appended entry's log index to what to do once THAT
+	// entry (verified by term — see pendingEntry) applies. Correct because
+	// both Propose and the read-barrier append exactly one entry per call,
+	// so "the index the leader's log was at before appending, plus one" is
 	// exactly that entry's index.
-	pending := map[uint64]chan proposeResult{}
+	pending := map[uint64]pendingEntry{}
 
 	for {
 		select {
 		case <-s.stopCh:
-			for _, ch := range pending {
-				ch <- proposeResult{err: errors.New("server: stopped")}
+			for _, pe := range pending {
+				pe.resolve(false)
 			}
 			return
 
@@ -309,23 +356,60 @@ func (s *Server) loop() {
 				continue
 			}
 			before := s.snapshot()
+			term := s.node.Term()
 			idx := s.node.LastIndex() + 1
 			s.node.Step(raft.Message{Type: raft.MsgProp, Entries: []raft.Entry{{Data: req.data}}})
 			s.afterStep(before)
-			pending[idx] = req.resp
+			pending[idx] = pendingEntry{term: term, resolve: func(applied bool) {
+				if !applied {
+					req.resp <- proposeResult{err: errors.New("server: proposal was not committed (this node lost leadership, or the server stopped, before it did)")}
+					return
+				}
+				req.resp <- proposeResult{applied: true}
+			}}
 
 		case req := <-s.getCh:
 			if s.node.Role() != raft.Leader {
-				req.resp <- getResult{leader: s.node.Lead()}
+				req.resp <- getResult{leader: s.node.Lead(), err: errNotLeader}
 				continue
 			}
-			// leader is left 0 here: this node already IS the leader, so a
-			// LeaderHint would be meaningless — the caller only consults it
-			// when found is false because of the *other* branch above (not
-			// currently the leader), and must not confuse "this leader has
-			// no such key" with "go ask someone else".
-			v, ok := s.fsm.Get(req.key)
-			req.resp <- getResult{value: v, found: ok}
+			// A linearizable read barrier: propose a no-op entry (fsm.Apply
+			// already treats nil Data as a no-op — the same shape as the
+			// no-op a new leader appends on election, raft.Node.becomeLeader)
+			// and only read the state machine once THAT entry has committed
+			// and applied, rather than answering from whatever is in the
+			// fsm right now.
+			//
+			// This is what actually closes the gap fsm.FSM.Get's doc warns
+			// about: a leader that has lost contact with the majority (a
+			// network partition, most concretely) can still believe it's
+			// the leader and can still answer a plain local read with data
+			// that's already stale relative to what the real majority has
+			// gone on to commit — internal/checker's chaos test caught
+			// exactly this once the fault window was widened enough to
+			// outlast an election. A no-op can only ever commit with a real
+			// majority behind it, so a stale/partitioned leader's read
+			// barrier simply never commits, and the read never answers,
+			// instead of answering wrong — the same fail-closed choice
+			// docs/DESIGN.md §1 makes for writes under a partition, now
+			// applied to reads too. The cost is real: every Get now pays a
+			// full replication round trip and a durable log entry, and (like
+			// Propose already did) has no timeout of its own — a caller stuck
+			// behind a permanently unreachable majority blocks forever, same
+			// as an undeliverable Propose already could.
+			before := s.snapshot()
+			term := s.node.Term()
+			idx := s.node.LastIndex() + 1
+			s.node.Step(raft.Message{Type: raft.MsgProp, Entries: []raft.Entry{{Data: nil}}})
+			s.afterStep(before)
+			pending[idx] = pendingEntry{term: term, resolve: func(applied bool) {
+				if !applied {
+					req.resp <- getResult{err: errors.New("server: read barrier was not committed (this node lost leadership, or the server stopped, before it did)")}
+					return
+				}
+				v, ok := s.fsm.Get(req.key)
+				req.resp <- getResult{value: v, found: ok}
+			}}
 		}
 
 		s.applyCommitted(pending)
@@ -375,8 +459,13 @@ func (s *Server) afterStep(before logSnapshot) {
 }
 
 // applyCommitted advances the state machine up to the node's current commit
-// index and wakes any Propose call whose entry just landed.
-func (s *Server) applyCommitted(pending map[uint64]chan proposeResult) {
+// index and resolves any Propose or read-barrier Get whose entry just landed
+// — for a Get this is the moment its answer is read from the fsm, since only
+// now is it guaranteed to reflect everything committed as of when the read
+// began (see the getCh case in loop for why). See pendingEntry for why a
+// term check gates every resolution: the index alone is not enough proof
+// that the entry now at it is the one the caller actually appended.
+func (s *Server) applyCommitted(pending map[uint64]pendingEntry) {
 	committed := s.node.Committed()
 	entries := s.node.Entries()
 	for s.lastApplied < committed {
@@ -385,9 +474,9 @@ func (s *Server) applyCommitted(pending map[uint64]chan proposeResult) {
 		if err := s.fsm.Apply(e.Data); err != nil {
 			panic(fmt.Sprintf("server: fsm apply failed for a committed entry, state machine is now suspect: %v", err))
 		}
-		if ch, ok := pending[s.lastApplied]; ok {
-			ch <- proposeResult{applied: true}
+		if pe, ok := pending[s.lastApplied]; ok {
 			delete(pending, s.lastApplied)
+			pe.resolve(pe.term == e.Term)
 		}
 	}
 }
@@ -442,13 +531,18 @@ type GetReply struct {
 	Value      []byte
 	Found      bool
 	LeaderHint uint64
+	Err        string
 }
 
-// Get is the client-facing read RPC. See fsm.FSM.Get for its consistency
-// caveat.
+// Get is the client-facing read RPC: linearizable, via Server.Get's read
+// barrier. Err is set exactly when Found/Value carry no information — see
+// Server.Get's doc for what that covers.
 func (f *rpcFacade) Get(args GetArgs, reply *GetReply) error {
 	s := (*Server)(f)
-	v, found, leader := s.Get(args.Key)
+	v, found, leader, err := s.Get(args.Key)
 	reply.Value, reply.Found, reply.LeaderHint = v, found, leader
+	if err != nil {
+		reply.Err = err.Error()
+	}
 	return nil
 }
