@@ -83,6 +83,25 @@ func New(c Config) *Node {
 	return n
 }
 
+// Restore seeds the node's term, granted vote, and log directly from
+// previously persisted state, bypassing the normal protocol transitions. It
+// exists so a caller (internal/storage) can replay a crashed node's durable
+// log and hand the result here to resume exactly where the crash interrupted
+// it — restart_replays_log in docs/DESIGN.md §6 — rather than starting blank.
+// Restore performs no I/O itself; loading bytes off disk is storage's job,
+// this only seeds the in-memory state machine. Call it once, immediately
+// after [New] and before any [Node.Step] or [Node.Tick].
+//
+// The commit index is deliberately left at 0: Raft never persists it, because
+// a restarted node safely relearns it from the current leader's next
+// AppendEntries rather than trusting a possibly-stale value of its own.
+func (n *Node) Restore(term, vote uint64, entries []Entry) {
+	n.term = term
+	n.vote = vote
+	n.log = newLog()
+	n.log.entries = append(n.log.entries, entries...)
+}
+
 // --- accessors used by callers and tests ------------------------------------
 
 func (n *Node) ID() uint64        { return n.id }
