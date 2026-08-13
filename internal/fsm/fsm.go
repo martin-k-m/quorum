@@ -83,14 +83,20 @@ func (f *FSM) Apply(cmd []byte) error {
 	return nil
 }
 
-// Get reads a key. The read is against whatever this node has applied so
-// far — on the leader immediately after a successful Propose that is exactly
-// what was just written, but this is a plain local read, not a linearizable
-// one: it does not implement the read-index/lease-read protocol that would
-// prove no newer write has committed elsewhere since. That refinement is
-// deliberately left for after M4 (see docs/DESIGN.md's milestone table); the
-// goal here is a working end-to-end Put/Get demo, not the final read
-// consistency story.
+// Get reads a key against whatever this FSM has applied so far. On its own
+// that is only ever a plain local read, not a linearizable one — nothing
+// here can tell whether a newer write has committed elsewhere since the
+// caller's last Apply.
+//
+// server.Server does not call this directly from a client-facing Get;
+// server.Server.loop first commits a no-op "read barrier" entry through the
+// normal Propose path and only calls FSM.Get once THAT entry has applied,
+// which is what actually makes the read linearizable — see the getCh case in
+// server.Server.loop for why a local read alone isn't enough (a partitioned
+// node can still believe it's the leader and would otherwise answer with
+// data already stale relative to what the real majority has since
+// committed; internal/checker's chaos test in internal/server is what
+// caught it).
 func (f *FSM) Get(key []byte) ([]byte, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

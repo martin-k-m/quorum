@@ -203,6 +203,7 @@ type getReply struct {
 	Value      []byte
 	Found      bool
 	LeaderHint uint64
+	Err        string
 }
 
 func runGet(args []string) error {
@@ -223,6 +224,9 @@ func runGet(args []string) error {
 	var reply getReply
 	if err := c.Call("Node.Get", getArgs{Key: []byte(*key)}, &reply); err != nil {
 		return err
+	}
+	if reply.Err != "" {
+		return fmt.Errorf("get rejected: %s", reply.Err)
 	}
 	if !reply.Found {
 		if reply.LeaderHint != 0 {

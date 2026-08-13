@@ -92,7 +92,10 @@ func TestPutThenGetAcrossTheCluster(t *testing.T) {
 		t.Fatal("Propose did not apply")
 	}
 
-	v, found, _ := leader.Get([]byte("x"))
+	v, found, _, err := leader.Get([]byte("x"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
 	if !found || string(v) != "1" {
 		t.Fatalf("Get on leader = (%q, %v) want (\"1\", true)", v, found)
 	}
