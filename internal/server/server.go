@@ -223,6 +223,13 @@ func (s *Server) Stop() {
 	})
 }
 
+// Sender exposes this node's outbound transport for fault injection
+// (milestone M5: docs/DESIGN.md §6 layer 2, applied to the real networked
+// server rather than the pure-core simulator). Blocking or unblocking a peer
+// here only cuts this node's outbound half of the link; a full two-way
+// partition needs the same call made on the peer's own Server too.
+func (s *Server) Sender() *transport.Sender { return s.sender }
+
 // Propose submits a command to be replicated. It blocks until the command is
 // committed and applied on this node, or is rejected because this node is not
 // currently the leader (in which case leaderHint, if nonzero, names who is).
