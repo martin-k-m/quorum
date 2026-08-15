@@ -322,9 +322,21 @@ func runMembershipSchedule(t *testing.T, seed int64, basePort int) []checker.Op 
 						case done && outcome.err == nil && outcome.ok:
 							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: ret})
 							break attempts
-						case !done:
+						case done && outcome.err == nil && !outcome.ok:
+							// "Not the leader": rejected before anything was
+							// appended, so there is nothing to record.
+
+						default:
 							// Submitted, outcome never observed: it may still
-							// commit. See checker.Op.InDoubt.
+							// commit. See checker.Op.InDoubt. This covers a
+							// timeout and an error return alike — Server.Propose
+							// reports "proposal was not committed" when this node
+							// lost leadership or stopped before it saw the commit,
+							// neither of which rules out the entry committing on
+							// the surviving majority. Membership churn makes
+							// leadership changes mid-proposal routine, so this
+							// path matters more here than anywhere else.
+							// See docs/BUGS.md §5.
 							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: ret, InDoubt: true})
 						}
 					} else {
