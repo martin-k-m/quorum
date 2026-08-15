@@ -1,6 +1,9 @@
 package raft
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // add introduces a new, empty node to the test network — a machine that has
 // just been switched on, before any configuration change has made it a member.
@@ -19,7 +22,7 @@ func (net *network) confChange(leader uint64, voters ...uint64) (uint64, error) 
 func TestJointQuorumNeedsAMajorityOfBothConfigurations(t *testing.T) {
 	joint := Configuration{Voters: []uint64{3, 4, 5}, Outgoing: []uint64{1, 2, 3}}
 	set := func(ids ...uint64) func(uint64) bool {
-		return func(id uint64) bool { return contains(ids, id) }
+		return func(id uint64) bool { return slices.Contains(ids, id) }
 	}
 	cases := []struct {
 		name string

@@ -133,11 +133,9 @@ func (n *Node) Restore(term, vote uint64, entries []Entry) {
 	n.vote = vote
 	n.log = newLog()
 	n.log.entries = append(n.log.entries, entries...)
-	// The configuration is a function of the log, so replaying the log
-	// restores it — including a membership change that was appended but had
-	// not committed when the crash happened, which is exactly right: a
-	// configuration entry takes effect on append, so the pre-crash node was
-	// already using it and the recovered node must agree.
+	// The configuration is a function of the log, so replaying restores it,
+	// including a change appended but not committed before the crash — the
+	// pre-crash node was already using it, so the recovered node must agree.
 	n.recomputeConfig()
 }
 
@@ -184,18 +182,11 @@ func (n *Node) lastConfigIndex() uint64 {
 }
 
 // recomputeConfig re-derives the configuration from the log. It must be
-// called after every mutation of the log — an append by a leader, an append
-// or a truncation by a follower, a replay on restart — because a
-// configuration entry takes effect the moment it is *appended*, before it
-// commits.
-//
-// Taking effect on append rather than on commit looks backwards (the entry
-// might yet be discarded) but is required for safety: a leader that counted
-// the old configuration's quorum until the new one committed could commit the
-// change with a majority that the new configuration does not include, and
-// then the change itself would be lost by a subsequent leader that never had
-// it. Because the effect is tied to the log and the log is what a truncation
-// rolls back, a discarded configuration entry automatically un-applies here.
+// called after every mutation of the log — a leader's append, a follower's
+// append or truncation, a replay on restart — because a configuration entry
+// takes effect the moment it is *appended*, before it commits. Deriving it
+// rather than storing it is what makes a truncated entry un-apply for free.
+// See docs/DESIGN.md §10.1 for why append and not commit.
 func (n *Node) recomputeConfig() {
 	cfg := n.base
 	for i := len(n.log.entries) - 1; i >= 1; i-- {
@@ -205,9 +196,8 @@ func (n *Node) recomputeConfig() {
 		}
 		decoded, err := DecodeConfiguration(e.Data)
 		if err != nil {
-			// A conf change entry that does not decode is a bug in this
-			// package or a corrupt log that storage's CRC should already have
-			// caught; continuing with the wrong membership is not safe.
+			// Storage's CRC should have caught a corrupt log first; either
+			// way, continuing with the wrong membership is not safe.
 			panic("raft: undecodable configuration entry in the log: " + err.Error())
 		}
 		cfg = decoded
@@ -255,20 +245,11 @@ func (n *Node) resetElectionTimeout() {
 // Step delivers one message to the node, advancing its state and possibly
 // queuing outbound messages. It is the whole protocol entry point.
 func (n *Node) Step(m Message) {
-	// A vote request from a node that is not in our configuration is ignored
-	// outright — not answered, and crucially not allowed to bump our term.
-	//
-	// This is the disruption hazard of membership changes (Raft paper §6):
-	// a removed server never learns it was removed (nobody sends it anything
-	// any more), so it times out forever, campaigns at ever-higher terms, and
-	// every one of those requests would otherwise force the healthy leader to
-	// step down and cost the cluster an election. Discarding the message
-	// entirely is safe precisely because the sender is not a voter: it cannot
-	// be part of any quorum, so refusing it can never prevent a legitimate
-	// election. A node that is genuinely still a member but whose removal we
-	// wrongly believe in cannot happen either — our configuration comes from
-	// the log, and a configuration entry is only in our log if the leader that
-	// created it put it there.
+	// A vote request from a node outside our configuration is ignored outright
+	// — not answered, and crucially not allowed to bump our term, which is
+	// what stops a removed server from unseating a healthy leader forever.
+	// Discarding it is safe because a non-voter cannot be part of any quorum,
+	// so this can never block a legitimate election. See docs/DESIGN.md §10.1.
 	if m.Type == MsgVote && !n.config.IsVoter(m.From) {
 		return
 	}
@@ -470,26 +451,8 @@ func (n *Node) appendOwn(e Entry) {
 // may call it; it returns the log index of the joint entry so the caller can
 // tell when the change has been accepted.
 //
-// Three guards stand in front of the append, each closing a way a
-// reconfiguration can break the majority guarantee:
-//
-//   - An empty target configuration is refused. There is no majority of no
-//     nodes, so the cluster could never again elect a leader or commit
-//     anything; the log would be intact and completely useless.
-//
-//   - Only one change may be in flight. Overlapping changes give two joint
-//     configurations at once, and the double-majority argument only covers
-//     one pair of configurations; with C_old,new and C_new,newer both live,
-//     C_old and C_newer can share no node and elect two leaders in one term.
-//
-//   - The leader must first have committed an entry from its own term. A
-//     freshly elected leader's log tail may still be uncommitted, which means
-//     the configuration it is currently deriving from that tail may yet be
-//     truncated away. Basing a new change on a configuration that is about to
-//     be discarded produces exactly the "committed with the wrong majority"
-//     hazard the joint step exists to prevent. The no-op every leader appends
-//     on election (becomeLeader) is what satisfies this, usually within one
-//     round trip.
+// The three guards below each close a way a reconfiguration can break the
+// majority guarantee; docs/DESIGN.md §10.1 works through them.
 func (n *Node) ProposeConfChange(voters []uint64) (index uint64, err error) {
 	if n.role != Leader {
 		return 0, ErrNotLeader
@@ -514,17 +477,14 @@ func (n *Node) ProposeConfChange(voters []uint64) (index uint64, err error) {
 	return index, nil
 }
 
-// maybeLeaveJoint completes a membership change: once the joint
-// configuration's entry has committed — which, by the joint quorum rule,
-// proves a majority of both the old and the new configuration has it — it is
-// safe for the cluster to start deciding by C_new alone, so the leader
+// maybeLeaveJoint completes a membership change: once the joint entry has
+// committed — proving, by the joint quorum rule, that a majority of both
+// configurations holds it — deciding by C_new alone is safe, so the leader
 // appends the final configuration entry.
 //
 // This runs on whichever node is leader when the joint entry commits, not
-// necessarily the one that started the change. That is deliberate and is the
-// reason a membership change survives a leader failure mid-change: a new
-// leader derives the joint configuration from its own log like everything
-// else, and finishes the transition the old leader began.
+// necessarily the one that started the change. That is what makes a
+// membership change survive the failure of the leader that began it.
 func (n *Node) maybeLeaveJoint() {
 	if n.role != Leader || !n.config.IsJoint() {
 		return
@@ -539,13 +499,9 @@ func (n *Node) maybeLeaveJoint() {
 		Type: EntryConfChange, Data: EncodeConfiguration(final),
 	})
 	n.broadcastAppend()
-	// Send the final entry to the nodes it removes, too. Nothing requires
-	// this — Raft is explicit that a removed server may never find out — but
-	// a node that learns of its own removal stops campaigning, which is one
-	// less source of disruption for the cluster it just left. It is a
-	// courtesy, not a guarantee: a removed node that is unreachable right now
-	// simply never gets the news, which is why the ignore-its-vote rule in
-	// Step has to exist regardless.
+	// Tell the departing nodes too, as a courtesy: one that hears stops
+	// campaigning. Nothing requires it, and an unreachable one never hears,
+	// which is why Step's ignore-its-vote rule has to exist regardless.
 	for _, id := range departing {
 		if id != n.id && !final.IsVoter(id) {
 			n.sendAppend(id)

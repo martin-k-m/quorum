@@ -30,6 +30,66 @@ func callWithTimeout[T any](timeout time.Duration, fn func() T) (T, bool) {
 	}
 }
 
+// tryPut proposes a Put at s and records the outcome. It reports whether the
+// operation is settled, i.e. whether the client may stop trying nodes.
+//
+// There are three outcomes here, not two, and collapsing them into two is the
+// mistake behind docs/BUGS.md §4 and §5. A definite success is a real write.
+// "Not the leader" is rejected by Server.loop before anything is appended, so
+// there is genuinely nothing to record. *Everything else* is IN DOUBT: a
+// timeout is still running inside the server, and an error means only that
+// this node lost leadership or stopped before it saw the commit — neither
+// rules out the entry committing on the surviving majority. Dropping those
+// rather than recording them as in-doubt is unsound in both directions.
+func tryPut(rec *checker.Recorder, s *Server, clientID int, key, value string, timeout time.Duration) bool {
+	type outcome struct {
+		ok  bool
+		err error
+	}
+	call := time.Now()
+	res, done := callWithTimeout(timeout, func() outcome {
+		ok, _, err := s.Propose(fsm.EncodePut([]byte(key), []byte(value)))
+		return outcome{ok, err}
+	})
+	op := checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: time.Now()}
+	switch {
+	case done && res.err == nil && res.ok:
+		rec.Record(op)
+		return true
+	case done && res.err == nil && !res.ok:
+		return false
+	default:
+		op.InDoubt = true
+		rec.Record(op)
+		return false
+	}
+}
+
+// tryGet reads key at s and records the observation, reporting whether the
+// operation is settled. A timed-out or failed read is recorded as nothing:
+// found/value carry no information about actual state then (see Server.Get's
+// doc), and recording an aborted read as a confirmed observation is what made
+// an earlier version of this harness report impossible histories. No in-doubt
+// record is needed either, since a read changes nothing and so cannot affect
+// another operation's legality.
+func tryGet(rec *checker.Recorder, s *Server, clientID int, key string, timeout time.Duration) bool {
+	type outcome struct {
+		value []byte
+		found bool
+		err   error
+	}
+	call := time.Now()
+	res, done := callWithTimeout(timeout, func() outcome {
+		v, found, _, err := s.Get([]byte(key))
+		return outcome{v, found, err}
+	})
+	if !done || res.err != nil {
+		return false
+	}
+	rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpGet, Call: call, Return: time.Now(), ResultFound: res.found, ResultValue: res.value})
+	return true
+}
+
 // runSchedule drives one fault-injected chaos run against a fresh 3-node
 // cluster: several client goroutines hammer a handful of keys with Put/Get
 // while a separate goroutine partitions and heals the network mid-run, and
