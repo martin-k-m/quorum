@@ -19,8 +19,8 @@ the network breaks.
 
 ## Status
 
-M1 through M6 (of the 7-milestone plan in [docs/DESIGN.md](docs/DESIGN.md) §8)
-are done — a runnable cluster with its correctness checked, not just asserted:
+All seven milestones of the plan in [docs/DESIGN.md](docs/DESIGN.md) §8 are
+done — a runnable cluster with its correctness checked, not just asserted:
 
 - **M1 — the pure Raft core** (`internal/raft`): leader election and log
   replication as a deterministic state machine with no I/O, no clock, no
@@ -100,8 +100,60 @@ are done — a runnable cluster with its correctness checked, not just asserted:
   and the third would be very easy to ship undetected in a hand-rolled
   Raft-KV without one.
 
-Remaining (see §8): M7 (stretch) — dynamic membership and swapping in strata
-itself as the storage backend.
+- **M7 — dynamic membership by joint consensus** (`internal/raft/config.go`):
+  the voting configuration is a value the cluster agrees on, living in the
+  replicated log as a configuration entry, so a node derives its membership
+  from its own log rather than from a field somebody sets. While a change is in
+  flight every decision needs a majority of the old configuration *and* of the
+  new one, so the two can never act independently and an arbitrary change
+  ({1,2,3} straight to {3,4,5}) is no harder than adding one node. A removed
+  node's vote request is ignored outright rather than rejected, so it cannot
+  disrupt the cluster by campaigning at ever-rising terms. Covered by tests in
+  the simulator, on the real transport, and under the linearizability checker
+  with membership churn concurrent with a partition
+  (`TestLinearizabilityAcrossMembershipChanges`).
+
+  Swapping in `strata` as the storage backend was the other half of M7 as
+  originally sketched and was **dropped on purpose**; §10.4 of the design doc
+  records the reasoning.
+
+### What is measured, and what is known broken
+
+- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** — throughput, latency
+  (median and p99), election-time distribution over 25 trials, and
+  partition-heal behaviour, with the environment and exact commands recorded.
+  Regenerate every number with [`bench/run.sh`](bench) or `bench\run.ps1`.
+  The headline: ~500-600 writes/s on 3 nodes, **flat regardless of client
+  concurrency**, because there is one `fsync` per log entry and no batching.
+  A CPU profile puts 82% of all samples inside that single `fsync`.
+- **[docs/BUGS.md](docs/BUGS.md)** — the five real defects found so far, what
+  caught each, and the regression test that pins it.
+- **[docs/DECISIONS.md](docs/DECISIONS.md)** — the choices that had a real
+  alternative, including the known gaps: no log compaction (the log grows
+  without bound), no lease read path, no batching or pipelining, and no
+  learner phase for a node being added.
+
+### What "linearizable" and "durable" mean here, concretely
+
+Both words are load-bearing claims, so each links to the thing that
+demonstrates it rather than asserting it:
+
+| Claim | Demonstrated by |
+|---|---|
+| Writes are linearizable | `TestLinearizabilityAcrossFaultInjectedSchedules` — 25 fault-injected schedules, checked by `internal/checker` |
+| Reads are linearizable | The read barrier in `Server.Get`; the plain local read it replaced is [BUGS.md §2](docs/BUGS.md) |
+| Holds under randomized faults | `TestLinearizabilitySoak` — randomized partitions, a lossy network, and crash-restart mid-write on 3- and 5-node clusters (`-quorum.soak`) |
+| Holds across membership changes | `TestLinearizabilityAcrossMembershipChanges` |
+| A minority cannot commit | `TestPartitionMinorityCannotCommitOverRealNetwork` |
+| The log is crash-safe | `TestCrashMidWriteRecoversTheValidPrefix` — truncates the log at every byte offset and checks recovery yields a clean prefix |
+| Applied state survives restart | `TestRestartRecoversAppliedState` |
+
+Two limits on the word "durable" worth stating plainly: an entry is fsynced
+before it is acknowledged, but **the log is never compacted**, so a
+long-running node will fill its disk and restart time grows with total writes
+ever performed (see [DECISIONS.md](docs/DECISIONS.md) §2). And the
+linearizability evidence is a large number of checked randomized histories, not
+a proof: it means no violation has been found, not that none exists.
 
 All tests pass under `go test -race ./...`, repeatedly.
 

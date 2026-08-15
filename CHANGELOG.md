@@ -5,12 +5,38 @@ All notable changes to quorum are documented here. The format follows
 follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing is released yet. The history below is the milestone plan in
-[docs/DESIGN.md](docs/DESIGN.md) §8 as it was actually built; M1 through M6 are
-done and M7 is not started, so it all sits under Unreleased.
+[docs/DESIGN.md](docs/DESIGN.md) §8 as it was actually built. All seven
+milestones are done, so it all sits under Unreleased.
 
 ## [Unreleased]
 
 ### Added
+
+- **Measured performance, and the evidence behind the correctness claims.**
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md) records write and linearizable-read
+  throughput and latency (median and p99) on 3- and 5-node clusters, the
+  distribution of leader-election time over 25 trials, and throughput across a
+  partition heal, with the machine and the exact commands named;
+  [`bench/`](bench) regenerates all of it. The headline finding is that
+  throughput is flat regardless of client concurrency, because there is one
+  `fsync` per log entry and no batching — a CPU profile puts 82% of samples
+  inside that single `fsync`. [docs/DECISIONS.md](docs/DECISIONS.md) records
+  the choices that had a real alternative, including the known gaps.
+
+- **A randomized linearizability soak** (`internal/server/soak_test.go`,
+  behind `-quorum.soak`). Randomized partitions across arbitrary groupings, a
+  lossy network, and crash-restart of a random node mid-write, on 3- and
+  5-node clusters, every schedule reproducible from its seed. Runs nightly in
+  CI along with a repeated `-race` suite.
+
+- **M7 — dynamic membership by joint consensus** (`internal/raft/config.go`).
+  The voting configuration is a value the cluster agrees on, carried in the
+  replicated log, so a node derives its membership from its own log. A change
+  passes through a joint configuration in which every decision needs a
+  majority of both the old and the new voter sets. A removed node's vote
+  request is ignored outright so it cannot disrupt the cluster by campaigning
+  at rising terms. Swapping in `strata` as the storage backend was the other
+  half of M7 as sketched and was dropped on purpose; see DESIGN.md §10.4.
 
 - **M6 — a linearizability checker, and the read barrier it forced**
   (`internal/checker`). Given a recorded history of concurrent client
@@ -30,7 +56,9 @@ done and M7 is not started, so it all sits under Unreleased.
   (`internal/transport`, `internal/server`, `cmd/quorum`). `net/rpc` with
   `encoding/gob` between nodes, a single event-loop goroutine owning each node
   end to end, and a CLI: `quorum serve` runs a node, `quorum put`/`get`/`delete`
-  talk to a live cluster and follow leader redirects.
+  talk to a live cluster. Only the leader accepts those; a follower rejects the
+  call and names the current leader, and the CLI prints that hint rather than
+  following it, so retrying against the named node is the caller's job.
 
 - **M3 — durable storage and crash/restart** (`internal/storage`). A
   length-prefixed, CRC32-checked, fsynced log holding term, vote and entries. A
@@ -53,7 +81,26 @@ done and M7 is not started, so it all sits under Unreleased.
 
 ### Fixed
 
-Three bugs found by building and running the M6 checker, all in that milestone:
+Five bugs so far, four of them found by the linearizability checker. Full
+write-ups, with the mechanism and the regression test for each, are in
+[docs/BUGS.md](docs/BUGS.md).
+
+Two in the checking apparatus itself, which are the ones that decide whether
+any other result means anything:
+
+- **Timed-out and errored writes were dropped from recorded histories.** A
+  write whose outcome the client never learned may still commit, so removing it
+  is unsound in both directions: it manufactures false violations, and it can
+  hide real ones. `checker.Op` gained `InDoubt` (Jepsen's `:info` case), checked
+  as an optional operation that may be placed anywhere at or after its call or
+  left out entirely. The first fix covered timeouts; the randomized soak later
+  found the same hole one branch away, for a `Propose` that returns an *error*
+  because the node lost leadership or stopped before it observed the commit —
+  neither of which means the entry failed to commit elsewhere. That second gap
+  produced eight false violations on the soak's first run and is fixed in all
+  three chaos harnesses. See BUGS.md §4 and §5.
+
+Three found by building and running the M6 checker, all within that milestone:
 
 - **Tied timestamps were treated as a forced ordering.** Two operations whose
   `Return` and `Call` landed on the same instant, routine on a clock of finite
