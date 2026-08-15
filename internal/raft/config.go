@@ -3,24 +3,16 @@ package raft
 import (
 	"encoding/binary"
 	"fmt"
-	"sort"
+	"slices"
 )
 
 // Configuration is the set of nodes that count toward a quorum. In the steady
 // state only Voters is populated. During a membership change the
 // configuration is *joint*: Voters holds the incoming configuration (C_new)
-// and Outgoing holds the one being replaced (C_old), and every decision —
-// electing a leader, committing an entry — needs a separate majority from
-// each of the two sets independently.
-//
-// That double-majority requirement is the whole safety argument for joint
-// consensus (Raft paper §6). While the joint configuration is in force, no
-// decision can be made by C_old alone or by C_new alone, so the two
-// configurations can never independently elect two leaders or commit two
-// conflicting entries — which is exactly the hazard of letting a cluster
-// switch directly from {1,2,3} to {3,4,5}: for a moment {1,2} and {4,5} each
-// look like a majority of *some* configuration, and both could win an
-// election in the same term.
+// and Outgoing the one being replaced (C_old), and every decision needs a
+// separate majority from each set independently. That double-majority rule is
+// the whole safety argument for joint consensus (Raft paper §6,
+// docs/DESIGN.md §10.1).
 type Configuration struct {
 	Voters   []uint64
 	Outgoing []uint64 // non-empty only while a membership change is in flight
@@ -33,30 +25,16 @@ func (c Configuration) IsJoint() bool { return len(c.Outgoing) > 0 }
 // IsVoter reports whether id counts toward a quorum in either half of this
 // configuration.
 func (c Configuration) IsVoter(id uint64) bool {
-	return contains(c.Voters, id) || contains(c.Outgoing, id)
+	return slices.Contains(c.Voters, id) || slices.Contains(c.Outgoing, id)
 }
 
-// All returns every node id in either half, sorted and deduplicated. Sorted
-// because the whole raft package is expected to be deterministic: any loop
-// that produces messages must produce them in the same order on every replay,
-// or internal/testsim's reproducibility guarantee quietly stops holding.
+// All returns every node id in either half, deduplicated and sorted. Sorted
+// because any loop that produces messages must produce them in the same order
+// on every replay, or internal/testsim's reproducibility stops holding.
 func (c Configuration) All() []uint64 {
-	seen := map[uint64]bool{}
-	out := make([]uint64, 0, len(c.Voters)+len(c.Outgoing))
-	for _, id := range c.Voters {
-		if !seen[id] {
-			seen[id] = true
-			out = append(out, id)
-		}
-	}
-	for _, id := range c.Outgoing {
-		if !seen[id] {
-			seen[id] = true
-			out = append(out, id)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
+	out := append(append([]uint64(nil), c.Voters...), c.Outgoing...)
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // HasQuorum reports whether the nodes satisfying ok form a majority of this
@@ -106,54 +84,28 @@ func majorityIndex(ids []uint64, match func(id uint64) uint64) uint64 {
 	for _, id := range ids {
 		ms = append(ms, match(id))
 	}
-	sort.Slice(ms, func(i, j int) bool { return ms[i] < ms[j] })
+	slices.Sort(ms)
 	// The largest index present on a majority is the (len-quorum)th smallest.
 	return ms[len(ms)-(len(ids)/2+1)]
 }
 
-func contains(ids []uint64, id uint64) bool {
-	for _, x := range ids {
-		if x == id {
-			return true
-		}
-	}
-	return false
-}
-
+// normalize sorts, deduplicates, and drops None, so two spellings of the same
+// voter set compare and encode identically.
 func normalize(ids []uint64) []uint64 {
-	seen := map[uint64]bool{}
 	out := make([]uint64, 0, len(ids))
 	for _, id := range ids {
-		if id != None && !seen[id] {
-			seen[id] = true
+		if id != None {
 			out = append(out, id)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // Equal reports whether two configurations name the same nodes in both halves.
 func (c Configuration) Equal(o Configuration) bool {
-	a, b := normalize(c.Voters), normalize(o.Voters)
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	a, b = normalize(c.Outgoing), normalize(o.Outgoing)
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(normalize(c.Voters), normalize(o.Voters)) &&
+		slices.Equal(normalize(c.Outgoing), normalize(o.Outgoing))
 }
 
 func (c Configuration) String() string {
@@ -164,10 +116,9 @@ func (c Configuration) String() string {
 }
 
 // EncodeConfiguration serializes a Configuration into the Data of an
-// EntryConfChange log entry. The encoding is deliberately explicit rather
-// than gob or JSON: this goes on disk through internal/storage and over the
-// wire through internal/transport, and a fixed byte layout is one less thing
-// that can silently change meaning between versions.
+// EntryConfChange log entry. The layout is explicit rather than gob or JSON
+// because these bytes go on disk and over the wire, and a fixed byte layout
+// cannot silently change meaning between versions.
 func EncodeConfiguration(c Configuration) []byte {
 	v, o := normalize(c.Voters), normalize(c.Outgoing)
 	b := make([]byte, 8+8*len(v)+8*len(o))
