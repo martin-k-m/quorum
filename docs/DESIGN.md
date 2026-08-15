@@ -134,7 +134,8 @@ exhaustively and deterministically.
 A distributed system that only "seems to work when I run it" is worth little.
 `quorum`'s point of pride is that its correctness is *demonstrated*, using the
 same testing culture already visible in the portfolio (the property/fuzz suites
-in `quarry` and `sift`). Four layers:
+in `quarry` and `sift`). Five layers, plus the named regressions each of them
+has pinned down:
 
 1. **Unit tests on the pure core.** Because `raft.Step` is a pure function,
    every protocol rule is a table test: given this state and this message, expect
@@ -169,7 +170,34 @@ in `quarry` and `sift`). Four layers:
    read look impossible, and one that lands on top of another value can hide
    a real violation.
 
-4. **Named regression scenarios**, each pinning a classic failure mode:
+   The same reasoning applies to a call that returns an *error* rather than
+   timing out. `Server.Propose` reports that a proposal "was not committed"
+   when this node lost leadership or stopped before it observed the commit,
+   and neither of those rules out the entry committing on the surviving
+   majority. That case is in-doubt too. Missing it produced eight false
+   violations on the randomized soak's first run; see docs/BUGS.md §5. The
+   only outcome that may safely be left out of a history is an explicit "I am
+   not the leader", which `Server.loop` returns before appending anything.
+
+5. **A randomized soak** (`internal/server/soak_test.go`, behind
+   `-quorum.soak`). Layer 3 applies one fixed fault shape — a single 1-vs-2
+   partition, held longer than an election — repeated across seeds. The soak
+   randomizes the fault schedule instead: two-way partitions across arbitrary
+   groupings, a lossy network at a randomized drop rate, and crash-restart of
+   a random node from its own data directory while writes are in flight, on
+   3- and 5-node clusters. Each schedule is reproducible from its seed, and
+   it runs nightly in CI under `-race`.
+
+   Two limits worth naming. `checker.CheckKey` searches with a `uint64`
+   bitmask and refuses more than 63 operations on one key, so the soak's key
+   count and per-client operation count are chosen together to stay clear of
+   that, and the harness asserts it rather than trusting it. And the client
+   must retry with backoff rather than making one pass over the node list:
+   during a leaderless window every node rejects instantly, so a
+   non-retrying client burns its whole operation budget in milliseconds and
+   records an empty history, which tests nothing.
+
+6. **Named regression scenarios**, each pinning a classic failure mode:
    - `figure8` — the previous-term commit hazard of §4 must not lose a committed
      entry across a specific leader-change sequence;
    - `split_vote` — repeated simultaneous candidacies must still converge;
