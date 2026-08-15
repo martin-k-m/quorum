@@ -94,16 +94,37 @@ func runSchedule(t *testing.T, seed int64, basePort int) []checker.Op {
 						case done && outcome.err == nil && outcome.ok:
 							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: ret})
 							break attempts
-						case !done:
-							// The call timed out and is still running inside
-							// the server: this write may yet commit, at any
-							// later point, and there is no way for a client to
-							// find out. Recording it as in-doubt is what lets
-							// the checker consider both possibilities. Dropping
-							// it — what this harness did before M7 — is what
-							// made a heavily loaded run occasionally report a
-							// violation that was really just a slow write
-							// landing after its client gave up.
+						case done && outcome.err == nil && !outcome.ok:
+							// "Not the leader." Server.loop rejects this before
+							// appending anything, so nothing entered the log and
+							// there is genuinely nothing to record.
+
+						default:
+							// In doubt. Two paths reach here.
+							//
+							// The call timed out and is still running inside the
+							// server: this write may yet commit, at any later
+							// point, and there is no way for a client to find out.
+							// Recording it as in-doubt is what lets the checker
+							// consider both possibilities. Dropping it — what this
+							// harness did before M7 — is what made a heavily
+							// loaded run occasionally report a violation that was
+							// really just a slow write landing after its client
+							// gave up.
+							//
+							// Or the call returned an error, which is in doubt for
+							// the same reason and was missed here until the
+							// randomized soak (soak_test.go) found it.
+							// Server.Propose reports "proposal was not committed"
+							// when this node lost leadership or stopped before it
+							// observed the commit, and neither of those means the
+							// entry failed to commit elsewhere. This harness never
+							// crashes a node so it takes that path rarely, but
+							// rarely is not never: a leader whose uncommitted tail
+							// is truncated after a partition heal resolves its
+							// pending proposals exactly this way.
+							//
+							// See docs/BUGS.md §4 and §5.
 							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: ret, InDoubt: true})
 						}
 					} else {
