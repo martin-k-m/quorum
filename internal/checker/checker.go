@@ -62,16 +62,37 @@ type Op struct {
 	// have happened, not for any return value.
 	ResultFound bool
 	ResultValue []byte
+
+	// InDoubt marks an operation the client submitted but never learned the
+	// outcome of: it timed out, or the connection broke, and the request may
+	// still be sitting in the cluster waiting to commit. This is the ":info"
+	// case in Jepsen's vocabulary and it is not a detail — it is the normal
+	// fate of a write sent to a node that is about to be partitioned away,
+	// which is exactly what a fault-injected run produces on purpose.
+	//
+	// An in-doubt operation is checked as *optional*: a linearization may
+	// place it anywhere at or after its Call, or leave it out entirely,
+	// because both are things that could really have happened. Silently
+	// dropping such an operation instead (what this harness used to do) is
+	// unsound in both directions: a write that timed out and then committed
+	// makes a later Get look impossible, and a write that timed out and then
+	// committed *over* a value can hide a genuine violation. Return is
+	// ignored for an in-doubt operation, since there was no return.
+	InDoubt bool
 }
 
 func (op Op) String() string {
+	doubt := ""
+	if op.InDoubt {
+		doubt = " [in doubt: outcome never observed]"
+	}
 	switch op.Type {
 	case OpGet:
-		return fmt.Sprintf("client%d: Get(%q) -> found=%v value=%q", op.Client, op.Key, op.ResultFound, op.ResultValue)
+		return fmt.Sprintf("client%d: Get(%q) -> found=%v value=%q%s", op.Client, op.Key, op.ResultFound, op.ResultValue, doubt)
 	case OpPut:
-		return fmt.Sprintf("client%d: Put(%q, %q)", op.Client, op.Key, op.Value)
+		return fmt.Sprintf("client%d: Put(%q, %q)%s", op.Client, op.Key, op.Value, doubt)
 	default:
-		return fmt.Sprintf("client%d: Delete(%q)", op.Client, op.Key)
+		return fmt.Sprintf("client%d: Delete(%q)%s", op.Client, op.Key, doubt)
 	}
 }
 
@@ -141,11 +162,21 @@ func CheckKey(key string, ops []Op) Result {
 	}
 	unsolvable := map[memoKey]bool{}
 
+	// required is the set of operations a linearization must account for.
+	// In-doubt operations are excluded: the client never learned whether they
+	// took effect, so a linearization that leaves one out is just as faithful
+	// an explanation of what happened as one that includes it.
+	var required uint64
+	for i, op := range ops {
+		if !op.InDoubt {
+			required |= uint64(1) << uint(i)
+		}
+	}
+
 	order := make([]int, 0, n)
 	var search func(state register, mask uint64) bool
 	search = func(state register, mask uint64) bool {
-		full := uint64(1)<<uint(n) - 1
-		if mask == full {
+		if mask&required == required {
 			return true
 		}
 		mk := memoKey{mask: mask, state: state}
@@ -177,7 +208,9 @@ func CheckKey(key string, ops []Op) Result {
 	ok := search(register{}, 0)
 	res := Result{Key: key, Linearizable: ok, OpCount: n}
 	if ok {
-		res.Witness = make([]Op, n)
+		// The witness may be shorter than ops: any in-doubt operation the
+		// search chose to leave out is not part of this explanation.
+		res.Witness = make([]Op, len(order))
 		for i, idx := range order {
 			res.Witness[i] = ops[idx]
 		}
@@ -208,6 +241,12 @@ func CheckKey(key string, ops []Op) Result {
 func isMinimal(ops []Op, mask uint64, i int) bool {
 	for j := range ops {
 		if j == i || mask&(uint64(1)<<uint(j)) != 0 {
+			continue
+		}
+		if ops[j].InDoubt {
+			// j never returned, so nothing forces it to precede anything: it
+			// may still be pending right now. Treat it as if its interval ran
+			// to the end of time.
 			continue
 		}
 		if ops[j].Return.Before(ops[i].Call) {
