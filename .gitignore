@@ -1,0 +1,16 @@
+# Compiled binaries
+/quorum
+/quorum.exe
+/dist/
+/out/
+
+# Node data directories written by `quorum serve -data`
+/data/
+/data*/
+
+# Go test and coverage output
+*.test
+*.out
+
+# JetBrains
+.idea/

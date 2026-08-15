@@ -1,7 +1,11 @@
 # quorum
 
-A linearizable, replicated key-value store built on the Raft consensus
-algorithm, in Go, from the protocol up.
+**A linearizable, replicated key-value store built on the Raft consensus
+algorithm, in Go, from the protocol up.**
+
+[![CI](https://github.com/martin-k-m/quorum/actions/workflows/ci.yml/badge.svg)](https://github.com/martin-k-m/quorum/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-00ADD8?style=flat-square&logo=go&logoColor=fff)](https://go.dev)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 Where [strata](https://github.com/martin-k-m/strata) is a storage engine correct
 on one machine, `quorum` is the layer that makes a *cluster* agree: a value that
@@ -35,9 +39,12 @@ are done — a runnable cluster with its correctness checked, not just asserted:
 - **M4 — real transport and a runnable binary** (`internal/transport`,
   `internal/server`, `cmd/quorum`): `net/rpc` + gob between nodes, a single
   event-loop goroutine owning each node end to end, and a CLI — `quorum serve`
-  runs a node, `quorum put`/`get` talk to a live cluster with leader-redirect.
-  Verified against a real 3-node cluster, including killing the leader
-  mid-session and watching a new one take over.
+  runs a node, `quorum put`/`get`/`delete` talk to a live cluster. Only the
+  leader accepts either; a follower rejects the call and names the current
+  leader, and the CLI prints that hint rather than following it, so retrying
+  against the named node is the client's job. Verified against a real 3-node
+  cluster, including killing the leader mid-session and watching a new one
+  take over.
 - **M5 — fault injection on the real network** (`internal/transport`):
   `Block`/`Unblock` (two-way partitions) and a probabilistic drop rate,
   applied to the actual TCP path rather than a simulation — proving the wire
@@ -98,6 +105,54 @@ itself as the storage backend.
 
 All tests pass under `go test -race ./...`, repeatedly.
 
+## Run a cluster
+
+No third-party dependencies, so building is just Go:
+
+```sh
+go build ./cmd/quorum
+```
+
+Start three nodes, each with its own data directory. Every node is given the
+same peer list, and its own id out of it:
+
+```sh
+PEERS=1=localhost:9001,2=localhost:9002,3=localhost:9003
+./quorum serve -id 1 -peers $PEERS -data ./data1 &
+./quorum serve -id 2 -peers $PEERS -data ./data2 &
+./quorum serve -id 3 -peers $PEERS -data ./data3 &
+```
+
+Then read and write. Only the leader accepts a `put`, `get` or `delete`; a
+follower rejects the call and names the leader, and you retry against that
+node:
+
+```sh
+$ ./quorum put -addr localhost:9001 -key hello -value world
+quorum: not the leader; current leader is node 3
+$ ./quorum put -addr localhost:9003 -key hello -value world
+ok
+$ ./quorum get -addr localhost:9003 -key hello
+world
+$ ./quorum delete -addr localhost:9003 -key hello
+ok
+$ ./quorum get -addr localhost:9003 -key hello
+quorum: key not found
+```
+
+A `get` is not a local read: it commits a barrier entry through the log first,
+so it costs a replication round trip and returns an error rather than a stale
+value if the node has lost its majority.
+
+The peer protocol is `net/rpc` over plain TCP, with no authentication and no
+TLS. Run a cluster only on a network you control; see
+[SECURITY.md](SECURITY.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The most useful bug report is a failing
+seed from the linearizability checker.
+
 ## License
 
-MIT
+[MIT](LICENSE).
