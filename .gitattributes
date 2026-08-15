@@ -1,0 +1,7 @@
+# Keep line endings consistent everywhere.
+#
+# Git for Windows defaults to core.autocrlf=true, which rewrites tracked text
+# files to CRLF on checkout. CI runs the shell steps in ci.yml on Linux, so
+# pinning the working tree to LF keeps what is committed and what runs in
+# agreement regardless of who checked it out.
+* text=auto eol=lf
