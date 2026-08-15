@@ -41,6 +41,33 @@ func (r Role) String() string {
 	}
 }
 
+// EntryType distinguishes an ordinary state-machine command from a membership
+// change. Membership changes travel through the same replicated log as every
+// other entry — that is the point, it is what makes them agree — but they are
+// not commands for the key-value state machine and must never be handed to it.
+type EntryType uint8
+
+const (
+	// EntryNormal is an opaque state-machine command (or, with nil Data, the
+	// no-op a new leader appends and the no-op a read barrier commits).
+	EntryNormal EntryType = 0
+	// EntryConfChange carries an encoded Configuration (see
+	// EncodeConfiguration). Unlike a normal entry it takes effect when it is
+	// *appended*, not when it commits; see Node.recomputeConfig.
+	EntryConfChange EntryType = 1
+)
+
+func (t EntryType) String() string {
+	switch t {
+	case EntryNormal:
+		return "normal"
+	case EntryConfChange:
+		return "confchange"
+	default:
+		return "unknown"
+	}
+}
+
 // Entry is one command in the replicated log. Index is its 1-based position;
 // Term is the leader's term when it was created. The pair (Term, Index) uniquely
 // identifies an entry across the whole cluster and is the basis of the Log
@@ -48,7 +75,8 @@ func (r Role) String() string {
 type Entry struct {
 	Term  uint64
 	Index uint64
-	Data  []byte // the opaque command; nil for the no-op a new leader appends
+	Type  EntryType // EntryNormal unless this entry changes the configuration
+	Data  []byte    // the opaque command; nil for the no-op a new leader appends
 }
 
 // MsgType tags a Message. Some types are transport RPCs exchanged between nodes

@@ -22,9 +22,19 @@ import (
 	"github.com/martin-k-m/quorum/internal/transport"
 )
 
-// Config parameterizes a Server. Peers must list every node id in the
-// cluster, including ID. Addrs maps every peer id (including ID, though a
-// node never dials itself) to its net/rpc "host:port".
+// Config parameterizes a Server. Peers is the cluster's bootstrap voting
+// configuration and must include ID (unless this node is being started to
+// join an existing cluster, in which case Peers is the configuration it
+// expects to join and the real one arrives from the leader's log).
+//
+// Addrs maps node ids to their net/rpc "host:port". It is an *address book*,
+// not the membership: it may — and, if you intend to add nodes later, should
+// — name more nodes than Peers does. Membership is decided by consensus and
+// lives in the log; addressing is local configuration and is deliberately
+// kept out of the raft core, which never learns that an address exists (see
+// internal/transport's package doc). The practical consequence is recorded
+// in docs/DESIGN.md §10: a node can only be added to a running cluster if
+// the other nodes were already started knowing how to reach it.
 type Config struct {
 	ID            uint64
 	Peers         []uint64
@@ -82,6 +92,20 @@ type getReq struct {
 	resp chan getResult
 }
 
+type confResult struct {
+	// index is the log index of the joint configuration entry, once it has
+	// committed. done is false when the change never got that far.
+	index  uint64
+	done   bool
+	leader uint64
+	err    error
+}
+
+type confReq struct {
+	voters []uint64
+	resp   chan confResult
+}
+
 // Server is one running quorum node: a raft.Node plus everything around it.
 type Server struct {
 	cfg    Config
@@ -95,6 +119,7 @@ type Server struct {
 	inbox     chan raft.Message
 	proposeCh chan proposeReq
 	getCh     chan getReq
+	confCh    chan confReq
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 
@@ -119,6 +144,11 @@ type Status struct {
 	Leader    uint64 // raft.None if no leader is currently known
 	LastIndex uint64
 	Committed uint64
+	// Config is the membership this node currently believes in, derived from
+	// its own log — a node the leader has not caught up yet may still report
+	// the previous one. Config.IsJoint() is true while a membership change is
+	// in its overlap period.
+	Config raft.Configuration
 }
 
 // Status returns the most recent snapshot published by the event loop. Every
@@ -135,6 +165,7 @@ func (s *Server) publishStatus() {
 	s.status.Store(Status{
 		ID: s.cfg.ID, Role: s.node.Role(), Term: s.node.Term(),
 		Leader: s.node.Lead(), LastIndex: s.node.LastIndex(), Committed: s.node.Committed(),
+		Config: s.node.Config(),
 	})
 }
 
@@ -168,6 +199,7 @@ func New(cfg Config) (*Server, error) {
 		inbox:     make(chan raft.Message, 256),
 		proposeCh: make(chan proposeReq),
 		getCh:     make(chan getReq),
+		confCh:    make(chan confReq),
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 	}
@@ -275,6 +307,36 @@ func (s *Server) Get(key []byte) (value []byte, found bool, leaderHint uint64, e
 	return r.value, r.found, r.leader, r.err
 }
 
+// ChangeMembership reconfigures the cluster to the given set of voting node
+// ids, through joint consensus (see raft.Node.ProposeConfChange). Like
+// Propose it must be called on the leader, and it blocks until the joint
+// configuration entry has committed — the point at which the change is
+// agreed by a majority of both the old and the new configuration and can no
+// longer be lost. The leader then appends the final configuration entry on
+// its own; callers who need to see the change fully settled should poll
+// Status until Config is no longer joint (a normal client does not care, and
+// the cluster is fully available throughout).
+//
+// Adding a node also requires that node to be running and reachable, and
+// requires the other nodes to already have its address in their Config.Addrs
+// (see Config's doc).
+func (s *Server) ChangeMembership(voters []uint64) (index uint64, leaderHint uint64, err error) {
+	resp := make(chan confResult, 1)
+	select {
+	case s.confCh <- confReq{voters: voters, resp: resp}:
+	case <-s.stopCh:
+		return 0, 0, errors.New("server: stopped")
+	}
+	r := <-resp
+	if r.err != nil {
+		return 0, r.leader, r.err
+	}
+	if !r.done {
+		return 0, r.leader, errors.New("server: configuration change was not committed (this node lost leadership, or the server stopped, before it did)")
+	}
+	return r.index, 0, nil
+}
+
 // --- the event loop: the only goroutine that touches s.node -----------------
 
 // logSnapshot is a cheap-enough-to-copy view of everything about the node's
@@ -366,6 +428,23 @@ func (s *Server) loop() {
 					return
 				}
 				req.resp <- proposeResult{applied: true}
+			}}
+
+		case req := <-s.confCh:
+			// A membership change is a log entry like any other, so it
+			// resolves through the same pending map — and, like a Propose,
+			// only counts as committed if the entry that lands at its index
+			// still carries the term it was appended in.
+			before := s.snapshot()
+			term := s.node.Term()
+			idx, err := s.node.ProposeConfChange(req.voters)
+			s.afterStep(before)
+			if err != nil {
+				req.resp <- confResult{leader: s.node.Lead(), err: err}
+				continue
+			}
+			pending[idx] = pendingEntry{term: term, resolve: func(applied bool) {
+				req.resp <- confResult{index: idx, done: applied}
 			}}
 
 		case req := <-s.getCh:
@@ -471,8 +550,14 @@ func (s *Server) applyCommitted(pending map[uint64]pendingEntry) {
 	for s.lastApplied < committed {
 		s.lastApplied++
 		e := entries[s.lastApplied]
-		if err := s.fsm.Apply(e.Data); err != nil {
-			panic(fmt.Sprintf("server: fsm apply failed for a committed entry, state machine is now suspect: %v", err))
+		// A configuration entry is consensus bookkeeping, not a key-value
+		// command: raft.Node has already acted on it (on append, not here),
+		// and handing its encoded membership to the fsm would be decoded as
+		// a garbage command.
+		if e.Type == raft.EntryNormal {
+			if err := s.fsm.Apply(e.Data); err != nil {
+				panic(fmt.Sprintf("server: fsm apply failed for a committed entry, state machine is now suspect: %v", err))
+			}
 		}
 		if pe, ok := pending[s.lastApplied]; ok {
 			delete(pending, s.lastApplied)
@@ -541,6 +626,43 @@ func (f *rpcFacade) Get(args GetArgs, reply *GetReply) error {
 	s := (*Server)(f)
 	v, found, leader, err := s.Get(args.Key)
 	reply.Value, reply.Found, reply.LeaderHint = v, found, leader
+	if err != nil {
+		reply.Err = err.Error()
+	}
+	return nil
+}
+
+// MembersArgs/MembersReply and ChangeMembershipArgs/ChangeMembershipReply are
+// the wire shapes for the two membership RPCs. Members is answerable by any
+// node (it reports that node's own view); ChangeMembership needs the leader.
+type MembersArgs struct{}
+type MembersReply struct {
+	Voters   []uint64
+	Outgoing []uint64 // non-empty while a change is in its overlap period
+	Leader   uint64
+	Role     string
+}
+
+// Members reports this node's current view of the cluster membership.
+func (f *rpcFacade) Members(args MembersArgs, reply *MembersReply) error {
+	st := (*Server)(f).Status()
+	reply.Voters, reply.Outgoing = st.Config.Voters, st.Config.Outgoing
+	reply.Leader, reply.Role = st.Leader, st.Role.String()
+	return nil
+}
+
+type ChangeMembershipArgs struct{ Voters []uint64 }
+type ChangeMembershipReply struct {
+	Index      uint64
+	LeaderHint uint64
+	Err        string
+}
+
+// ChangeMembership is the client-facing reconfiguration RPC; see
+// Server.ChangeMembership.
+func (f *rpcFacade) ChangeMembership(args ChangeMembershipArgs, reply *ChangeMembershipReply) error {
+	idx, leader, err := (*Server)(f).ChangeMembership(args.Voters)
+	reply.Index, reply.LeaderHint = idx, leader
 	if err != nil {
 		reply.Err = err.Error()
 	}

@@ -32,8 +32,14 @@ type recordType byte
 
 const (
 	recState    recordType = 1 // term + vote
-	recEntry    recordType = 2 // one log entry, appended
+	recEntry    recordType = 2 // one log entry, appended (pre-M7: always a normal entry)
 	recTruncate recordType = 3 // drop every entry with index >= FromIndex
+	// recTypedEntry is recEntry plus the entry's raft.EntryType, added in M7
+	// when membership changes gave entries a kind. It is a new record type
+	// rather than an extra field on recEntry so a log written before M7 still
+	// replays: those records are all normal entries, which is exactly what
+	// recEntry now decodes to.
+	recTypedEntry recordType = 4
 )
 
 // Storage is a durable log backed by a single file. It is not safe for
@@ -190,12 +196,13 @@ func encodeState(term, vote uint64) []byte {
 }
 
 func encodeEntry(e raft.Entry) []byte {
-	p := make([]byte, 8+8+4+len(e.Data))
+	p := make([]byte, 8+8+1+4+len(e.Data))
 	binary.BigEndian.PutUint64(p[0:8], e.Term)
 	binary.BigEndian.PutUint64(p[8:16], e.Index)
-	binary.BigEndian.PutUint32(p[16:20], uint32(len(e.Data)))
-	copy(p[20:], e.Data)
-	return frame(recEntry, p)
+	p[16] = byte(e.Type)
+	binary.BigEndian.PutUint32(p[17:21], uint32(len(e.Data)))
+	copy(p[21:], e.Data)
+	return frame(recTypedEntry, p)
 }
 
 func encodeTruncate(fromIndex uint64) []byte {
@@ -233,6 +240,23 @@ func decode(payload []byte) (any, error) {
 		return raft.Entry{
 			Term:  binary.BigEndian.Uint64(p[0:8]),
 			Index: binary.BigEndian.Uint64(p[8:16]),
+			Type:  raft.EntryNormal,
+			Data:  data,
+		}, nil
+	case recTypedEntry:
+		p := payload[1:]
+		if len(p) < 21 {
+			return nil, fmt.Errorf("typed entry record: want at least 21 bytes, got %d", len(p))
+		}
+		dataLen := binary.BigEndian.Uint32(p[17:21])
+		if uint32(len(p)-21) != dataLen {
+			return nil, fmt.Errorf("typed entry record: data length mismatch: header says %d, have %d", dataLen, len(p)-21)
+		}
+		data := append([]byte(nil), p[21:]...)
+		return raft.Entry{
+			Term:  binary.BigEndian.Uint64(p[0:8]),
+			Index: binary.BigEndian.Uint64(p[8:16]),
+			Type:  raft.EntryType(p[16]),
 			Data:  data,
 		}, nil
 	case recTruncate:
