@@ -238,8 +238,12 @@ func TestRestartReplaysLogIntoARaftNode(t *testing.T) {
 		}
 	}
 	// The restarted node must still be able to vote correctly using its
-	// recovered log — the whole reason the log had to survive the crash.
-	n.Step(raft.Message{Type: raft.MsgVote, From: 5, Term: 5, LogIndex: 1, LogTerm: 1})
+	// recovered log — the whole reason the log had to survive the crash. The
+	// candidate has to be a member of the recovered configuration (node 3
+	// here): since M7 a vote request from a node outside the configuration is
+	// ignored outright rather than answered, so a non-member candidate would
+	// produce no reply at all and prove nothing about the recovered log.
+	n.Step(raft.Message{Type: raft.MsgVote, From: 3, Term: 5, LogIndex: 1, LogTerm: 1})
 	resp := n.ReadMessages()
 	if len(resp) != 1 || !resp[0].Reject {
 		t.Fatalf("a candidate with a shorter, older log must still be rejected after restart, got %+v", resp)

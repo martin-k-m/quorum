@@ -107,6 +107,7 @@ quorum/
        state.go          #   term, votedFor, log, commitIndex, role
        step.go           #   Step(msg) -> []output : the entire protocol as a pure function
        log.go            #   the replicated log + matching/consistency checks
+       config.go         #   the membership configuration and its quorum rules (M7, §10)
        election.go       #   candidate/vote logic
        replication.go    #   leader append/commit logic
     transport/           # gRPC (or net/rpc) — turns messages into wire bytes and back
@@ -159,6 +160,15 @@ in `quarry` and `sift`). Four layers:
    checker searched for a consistency violation across thousands of fault
    schedules and found none."
 
+   Since M7 the checker also models operations whose outcome the client never
+   learned (a write that timed out and may still commit later, Jepsen's
+   `:info` case). Such an operation is *optional*: a valid history may place
+   it anywhere at or after its call, or leave it out. Dropping those
+   operations instead, which the harness used to do, is unsound in both
+   directions: a slow write that lands after its client gave up makes a later
+   read look impossible, and one that lands on top of another value can hide
+   a real violation.
+
 4. **Named regression scenarios**, each pinning a classic failure mode:
    - `figure8` — the previous-term commit hazard of §4 must not lose a committed
      entry across a specific leader-change sequence;
@@ -168,6 +178,13 @@ in `quarry` and `sift`). Four layers:
      steps down and its uncommitted tail is overwritten;
    - `restart_replays_log` — a crashed-and-restarted node rejoins with its
      durable state intact.
+   - `overlap_needs_both_quorums` (M7): during a membership change, a majority
+     of the new configuration on its own must not commit anything.
+   - `change_survives_leader_loss` (M7): a membership change whose leader dies
+     mid-change either completes under the next leader or rolls back, and
+     never leaves the cluster stuck in the overlap period.
+   - `removed_node_cannot_disrupt` (M7): a removed node campaigning at ever
+     higher terms must not unseat the leader.
 
 The headline claim on the finished README will be measured, not asserted, in the
 spirit of `sift`'s benchmark: *"N fault schedules checked for linearizability
@@ -181,13 +198,14 @@ violations, zero found,"* with the seed range printed so anyone can rerun it.
 - **No sharding.** One Raft group, one keyspace. Sharding is an orthogonal layer
   (a router over many groups) and would dilute the focus on getting *one* group
   provably right.
-- **No dynamic membership in v1.** Cluster size is fixed at start. Joint-consensus
-  reconfiguration is a well-known, subtle extension planned for after the core is
-  proven — deliberately deferred rather than done badly.
-- **No custom persistence engine at first.** The durable log uses a simple
+- ~~**No dynamic membership in v1.**~~ **Delivered in M7**, by joint consensus,
+  as this section originally planned it. Cluster size is no longer fixed at
+  start: see §10.
+- **No custom persistence engine.** The durable log uses a simple
   length-prefixed, CRC-checked, `fsync`ed file — the same recovery discipline
-  `strata` already documents. Swapping in `strata` itself as the storage backend
-  is a natural later milestone that ties the two projects together.
+  `strata` already documents. Swapping in `strata` itself as the storage
+  backend was the other half of M7 and was **dropped on purpose**; §10 records
+  why.
 
 ## 8. Milestones (each independently buildable and tested)
 
@@ -199,7 +217,7 @@ violations, zero found,"* with the seed range printed so anyone can rerun it.
 | M4 | Real transport + `cmd/quorum` binary; a 3-node cluster you can `Put`/`Get` against | end-to-end demo |
 | M5 | Fault injection: partitions, drops, reorder | `figure8`, `partition_*` scenarios |
 | M6 | Linearizability checker over randomized fault runs | "N schedules, 0 violations" number |
-| M7 (stretch) | Dynamic membership; `strata` as the storage backend | joint-consensus tests |
+| M7 (stretch) | Dynamic membership by joint consensus (`strata` backend dropped, §10) | joint-consensus tests in the simulator, on the real transport, and under the linearizability checker |
 
 M1–M2 are the intellectual core and can be built and tested with zero
 networking — which is exactly why the pure-core design in §5 matters.
@@ -215,6 +233,119 @@ networking — which is exactly why the pure-core design in §5 matters.
   keeps the core free of any time type at all.
 - **Snapshotting:** deferred past v1, but the log-compaction seam should be left
   in the storage interface now so it is not a rewrite later.
+
+## 10. M7: dynamic membership (and the `strata` backend, dropped)
+
+### 10.1 Joint consensus, and why not single-server changes
+
+The membership of a `quorum` cluster is now itself a value the cluster agrees
+on: it lives in the replicated log as an `EntryConfChange`, and `internal/raft`
+derives its current configuration from its own log rather than from a field
+somebody sets. §7 planned joint consensus and that is what was built.
+
+The alternative in the Raft literature is the *single-server* change: add or
+remove one node at a time, so old and new majorities always overlap by
+construction and no joint step is needed. It is simpler, and it is also the
+version that turned out to have a real safety bug after the dissertation was
+published: with more than one change in flight, or with a change based on a
+configuration entry that a new leader has not yet committed, a single-server
+change can still commit under a majority that the surviving configuration does
+not contain. The fixes for it end up reintroducing most of joint consensus's
+sequencing rules anyway.
+
+Joint consensus is chosen because its safety argument is one sentence long and
+does not depend on how many nodes the change touches: **while a change is in
+flight, every decision needs a majority of the old configuration *and* a
+majority of the new one**, so the two configurations can never act
+independently, and an arbitrary change ({1,2,3} straight to {3,4,5}) is no
+harder than adding one node. The trade-off paid for that is a second log entry
+per change and an overlap period during which the cluster needs both quorums
+to be reachable, a strictly stronger availability requirement than the steady
+state. That period is short (one round trip), the cluster serves reads and
+writes throughout, and the requirement is exactly what makes the change safe.
+
+Two rules do the work, and both are in `internal/raft`:
+
+1. **A configuration entry takes effect when it is appended, not when it
+   commits.** Waiting for the commit would mean deciding the commit of the
+   change itself by the old configuration alone. Because the configuration is
+   *derived* from the log, an entry that is later truncated away un-applies
+   itself for free. A follower whose conflicting tail is overwritten reverts
+   to the previous configuration with no extra machinery, and so does a node
+   replaying its log after a crash.
+2. **At most one change in flight, and only from a leader that has already
+   committed an entry of its own term.** Overlapping changes give two joint
+   configurations at once, which the double-majority argument does not cover;
+   and a leader whose tail is still uncommitted may be deriving a
+   configuration that is about to be discarded. `ProposeConfChange` refuses
+   both, along with an empty configuration (a cluster with no voters can never
+   commit anything again).
+
+Completing the change is deliberately not the proposer's job: whichever node
+is leader when the joint entry commits appends the final configuration, so a
+change survives the failure of the leader that started it. A leader that
+removed itself keeps leading until the configuration excluding it commits,
+because it is the only node that can replicate that entry, and then steps down.
+
+The other half of membership changes is disruption rather than safety. A
+removed server is never told it was removed, so it times out forever and
+campaigns at ever-rising terms, and a bare Raft node would step down for each
+one. Two rules stop that: a vote request from a node outside the current
+configuration is **ignored outright**, not merely rejected, so it cannot even
+raise the recipient's term; and a node that is not a voter in its own
+configuration does not campaign at all. As a courtesy the leader also sends
+the final configuration entry to the nodes it removes, so a reachable one
+learns to stop.
+
+### 10.2 Membership is consensus; addressing is not
+
+`raft` never learns that an address exists, and M7 does not change that. A
+configuration entry carries node *ids* only. `server.Config.Addrs` is an
+address book that may name more nodes than the configuration does, and
+`cmd/quorum` splits the same way: `-peers` is the address book, `-voters` is
+the membership.
+
+The consequence, stated plainly because it is a real limitation: **a node can
+only be added to a running cluster if the other nodes were already started
+knowing how to reach it.** Making addresses travel through the log would fix
+that, at the cost of putting the network into the pure core, the one
+structural decision (§5) the whole project is organized around. The trade
+would not be worth it here.
+
+A node being added must also be started with the configuration it is *joining*
+(not one that includes itself), or it would campaign forever before anyone had
+heard of it and arrive with an inflated term.
+
+### 10.3 What M7 deliberately does not do
+
+- **No non-voting catch-up phase.** A node added with an empty log counts
+  toward quorums immediately, so the cluster's fault tolerance dips until it
+  has caught up. This is an availability cost, never a safety one, and the
+  fix (a learner state) is orthogonal.
+- **No leadership transfer.** Removing the leader works: it steps down and
+  the survivors elect a replacement. It costs one election.
+- **No automatic node discovery.** See §10.2.
+
+### 10.4 `strata` as the storage backend: considered, dropped
+
+The other half of M7 as originally sketched was swapping `strata` in as the
+durable log, tying the two portfolio projects together. It was dropped, and
+not for lack of time.
+
+`strata` is a Java storage engine. `quorum` is a Go binary. Wiring one into
+the other is a language-boundary problem: a JNI bridge, or a sidecar process
+with an IPC hop on the path of every `fsync`. None of that difficulty is
+distributed-systems difficulty. It would add a JVM to the runtime, a
+serialization format, and a new failure mode (the sidecar dying independently
+of the node) to buy a durable log the project already has: `internal/storage`
+implements the same length-prefixed, CRC-checked, `fsync`ed, torn-tail-
+truncating discipline `strata` documents, and it is crash-fuzz tested by
+truncating at every byte offset. The honest version of this milestone is one
+that says so rather than shipping a half-built bridge as a headline.
+
+The genuinely valuable version of "use a real storage engine here" is log
+compaction and snapshotting (§9), which `internal/storage` was shaped to
+leave room for. That is a `quorum` milestone, not a `strata` integration.
 
 ---
 

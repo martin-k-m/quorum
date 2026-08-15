@@ -111,6 +111,25 @@ func (net *Network) Crash(id uint64, electionTick, heartbeatTick int) {
 	net.Nodes[id] = raft.New(raft.Config{ID: id, Peers: peers, ElectionTick: electionTick, HeartbeatTick: heartbeatTick})
 }
 
+// Add introduces a brand new node to the simulated network, started with the
+// given bootstrap configuration and an empty log — a machine that has just
+// been switched on and is about to be added to a running cluster. It is not a
+// member of anything until a configuration change naming it commits; until
+// then it just sits there, and the leader will bring its log up to date the
+// moment it enters the configuration.
+func (net *Network) Add(id uint64, peers []uint64, electionTick, heartbeatTick int) {
+	net.Nodes[id] = raft.New(raft.Config{ID: id, Peers: peers, ElectionTick: electionTick, HeartbeatTick: heartbeatTick})
+}
+
+// ChangeMembership asks the node at id (expected to be the leader) to
+// reconfigure the cluster to the given voting set, through joint consensus.
+func (net *Network) ChangeMembership(id uint64, voters []uint64) (uint64, error) {
+	return net.Nodes[id].ProposeConfChange(voters)
+}
+
+// Config returns a node's current view of the cluster configuration.
+func (net *Network) Config(id uint64) raft.Configuration { return net.Nodes[id].Config() }
+
 // Campaign makes id start an election.
 func (net *Network) Campaign(id uint64) { net.Nodes[id].Step(raft.Message{Type: raft.MsgHup}) }
 
