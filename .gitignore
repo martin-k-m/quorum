@@ -10,7 +10,11 @@
 
 # Go test and coverage output
 *.test
+*.test.exe
 *.out
 
 # JetBrains
 .idea/
+
+# Benchmark output: regenerate with bench/run.sh, do not commit.
+bench/results/
