@@ -1,0 +1,20 @@
+# Compiled binaries
+/quorum
+/quorum.exe
+/dist/
+/out/
+
+# Node data directories written by `quorum serve -data`
+/data/
+/data*/
+
+# Go test and coverage output
+*.test
+*.test.exe
+*.out
+
+# JetBrains
+.idea/
+
+# Benchmark output: regenerate with bench/run.sh, do not commit.
+bench/results/

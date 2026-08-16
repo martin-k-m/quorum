@@ -30,6 +30,66 @@ func callWithTimeout[T any](timeout time.Duration, fn func() T) (T, bool) {
 	}
 }
 
+// tryPut proposes a Put at s and records the outcome. It reports whether the
+// operation is settled, i.e. whether the client may stop trying nodes.
+//
+// There are three outcomes here, not two, and collapsing them into two is the
+// mistake behind docs/BUGS.md §4 and §5. A definite success is a real write.
+// "Not the leader" is rejected by Server.loop before anything is appended, so
+// there is genuinely nothing to record. *Everything else* is IN DOUBT: a
+// timeout is still running inside the server, and an error means only that
+// this node lost leadership or stopped before it saw the commit — neither
+// rules out the entry committing on the surviving majority. Dropping those
+// rather than recording them as in-doubt is unsound in both directions.
+func tryPut(rec *checker.Recorder, s *Server, clientID int, key, value string, timeout time.Duration) bool {
+	type outcome struct {
+		ok  bool
+		err error
+	}
+	call := time.Now()
+	res, done := callWithTimeout(timeout, func() outcome {
+		ok, _, err := s.Propose(fsm.EncodePut([]byte(key), []byte(value)))
+		return outcome{ok, err}
+	})
+	op := checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: time.Now()}
+	switch {
+	case done && res.err == nil && res.ok:
+		rec.Record(op)
+		return true
+	case done && res.err == nil && !res.ok:
+		return false
+	default:
+		op.InDoubt = true
+		rec.Record(op)
+		return false
+	}
+}
+
+// tryGet reads key at s and records the observation, reporting whether the
+// operation is settled. A timed-out or failed read is recorded as nothing:
+// found/value carry no information about actual state then (see Server.Get's
+// doc), and recording an aborted read as a confirmed observation is what made
+// an earlier version of this harness report impossible histories. No in-doubt
+// record is needed either, since a read changes nothing and so cannot affect
+// another operation's legality.
+func tryGet(rec *checker.Recorder, s *Server, clientID int, key string, timeout time.Duration) bool {
+	type outcome struct {
+		value []byte
+		found bool
+		err   error
+	}
+	call := time.Now()
+	res, done := callWithTimeout(timeout, func() outcome {
+		v, found, _, err := s.Get([]byte(key))
+		return outcome{v, found, err}
+	})
+	if !done || res.err != nil {
+		return false
+	}
+	rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpGet, Call: call, Return: time.Now(), ResultFound: res.found, ResultValue: res.value})
+	return true
+}
+
 // runSchedule drives one fault-injected chaos run against a fresh 3-node
 // cluster: several client goroutines hammer a handful of keys with Put/Get
 // while a separate goroutine partitions and heals the network mid-run, and
@@ -75,6 +135,7 @@ func runSchedule(t *testing.T, seed int64, basePort int) []checker.Op {
 				// a client mid-partition still finds whichever side of the
 				// cluster is currently servicing writes/reads, exactly like
 				// cmd/quorum's client would by retrying against another node.
+			attempts:
 				for attempt := 0; attempt < len(servers); attempt++ {
 					s := servers[(clientID+attempt)%len(servers)]
 					if rng.Intn(2) == 0 {
@@ -89,9 +150,42 @@ func runSchedule(t *testing.T, seed int64, basePort int) []checker.Op {
 							return putOutcome{ok, err}
 						})
 						ret := time.Now()
-						if done && outcome.err == nil && outcome.ok {
+						switch {
+						case done && outcome.err == nil && outcome.ok:
 							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: ret})
-							break
+							break attempts
+						case done && outcome.err == nil && !outcome.ok:
+							// "Not the leader." Server.loop rejects this before
+							// appending anything, so nothing entered the log and
+							// there is genuinely nothing to record.
+
+						default:
+							// In doubt. Two paths reach here.
+							//
+							// The call timed out and is still running inside the
+							// server: this write may yet commit, at any later
+							// point, and there is no way for a client to find out.
+							// Recording it as in-doubt is what lets the checker
+							// consider both possibilities. Dropping it — what this
+							// harness did before M7 — is what made a heavily
+							// loaded run occasionally report a violation that was
+							// really just a slow write landing after its client
+							// gave up.
+							//
+							// Or the call returned an error, which is in doubt for
+							// the same reason and was missed here until the
+							// randomized soak (soak_test.go) found it.
+							// Server.Propose reports "proposal was not committed"
+							// when this node lost leadership or stopped before it
+							// observed the commit, and neither of those means the
+							// entry failed to commit elsewhere. This harness never
+							// crashes a node so it takes that path rarely, but
+							// rarely is not never: a leader whose uncommitted tail
+							// is truncated after a partition heal resolves its
+							// pending proposals exactly this way.
+							//
+							// See docs/BUGS.md §4 and §5.
+							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpPut, Value: []byte(value), Call: call, Return: ret, InDoubt: true})
 						}
 					} else {
 						call := time.Now()
@@ -114,9 +208,13 @@ func runSchedule(t *testing.T, seed int64, basePort int) []checker.Op {
 						// being logged as a confirmed "not found", which the
 						// checker then correctly flagged as impossible against
 						// the real committed history.
+						// A read that never returned needs no in-doubt record
+						// the way a write does: a read changes nothing, so
+						// whether it "happened" is unobservable and cannot
+						// affect any other operation's legality.
 						if done && outcome.err == nil {
 							rec.Record(checker.Op{Client: clientID, Key: key, Type: checker.OpGet, Call: call, Return: ret, ResultFound: outcome.found, ResultValue: outcome.value})
-							break
+							break attempts
 						}
 					}
 				}

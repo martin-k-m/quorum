@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: fmt · vet · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The whole suite, chaos runs included, takes well under a minute on a
+      # laptop, so nothing is gated out of CI. The one test that opts out of
+      # -short is TestLinearizabilityAcrossFaultInjectedSchedules; it runs here.
+      - name: Tests
+        run: go test ./... -race -timeout 10m
+
+      - name: Build
+        run: go build -o quorum ./cmd/quorum
+
+      # `quorum` with no recognised subcommand prints usage and exits 2, so
+      # this checks the output rather than the status.
+      - name: CLI smoke test
+        run: "./quorum --help 2>&1 | grep -q '^usage: quorum'"
