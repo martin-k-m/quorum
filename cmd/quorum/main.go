@@ -12,6 +12,23 @@
 //
 //	quorum put -addr=localhost:9001 -key=x -value=1
 //	quorum get -addr=localhost:9002 -key=x
+//
+// Membership is dynamic (M7). -peers is the address book, which may name
+// nodes that are not yet members; -voters is the voting configuration a node
+// starts with, defaulting to every id in -peers. To add a fourth node to the
+// cluster above, start it with the configuration it is joining — the three
+// nodes that are already there, not including itself — and then change the
+// configuration through any node:
+//
+//	quorum serve -id=4 -peers=1=localhost:9001,2=localhost:9002,3=localhost:9003,4=localhost:9004 -voters=1,2,3 -data=./data4
+//	quorum members -addr=localhost:9001
+//	quorum members -addr=localhost:9001 -voters=1,2,3,4
+//
+// Starting the joiner with -voters=1,2,3 matters: a node that believes it is
+// a voter but that the cluster has never heard of would campaign forever and
+// arrive with a wildly inflated term. Adding a node also requires the running
+// nodes to already know its address, since addressing is local configuration
+// and only membership goes through consensus.
 package main
 
 import (
@@ -46,6 +63,8 @@ func main() {
 		err = runGet(os.Args[2:])
 	case "delete":
 		err = runDelete(os.Args[2:])
+	case "members":
+		err = runMembers(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -57,7 +76,24 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: quorum <serve|put|get|delete> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: quorum <serve|put|get|delete|members> [flags]")
+}
+
+// parseIDs parses a "1,2,3" voter list.
+func parseIDs(spec string) ([]uint64, error) {
+	var ids []uint64
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("bad node id %q: %w", part, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // parsePeers parses "1=host:port,2=host:port,..." into an address table and
@@ -94,6 +130,7 @@ func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	id := fs.Uint64("id", 0, "this node's id (must appear in -peers)")
 	peers := fs.String("peers", "", "comma-separated id=host:port list, e.g. 1=localhost:9001,2=localhost:9002,3=localhost:9003")
+	voters := fs.String("voters", "", "comma-separated ids of the cluster's current voting configuration; defaults to every id in -peers. A node joining an existing cluster must be started with that cluster's configuration, which does not include itself")
 	data := fs.String("data", "./data", "directory for this node's durable log")
 	electionTick := fs.Int("election-tick", 10, "ticks of silence before a follower starts an election")
 	heartbeatTick := fs.Int("heartbeat-tick", 2, "ticks between a leader's heartbeats")
@@ -106,12 +143,26 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	// -peers is the address book; -voters is the membership. They are the
+	// same thing only when the cluster is being created from scratch.
+	config := ids
+	if *voters != "" {
+		config, err = parseIDs(*voters)
+		if err != nil {
+			return err
+		}
+		for _, v := range config {
+			if _, ok := addrs[v]; !ok {
+				return fmt.Errorf("-voters names node %d, which has no address in -peers", v)
+			}
+		}
+	}
 	if err := os.MkdirAll(*data, 0o755); err != nil {
 		return fmt.Errorf("create -data dir: %w", err)
 	}
 
 	srv, err := server.New(server.Config{
-		ID: *id, Peers: ids, Addrs: addrs, DataDir: *data,
+		ID: *id, Peers: config, Addrs: addrs, DataDir: *data,
 		ElectionTick: *electionTick, HeartbeatTick: *heartbeatTick, TickInterval: *tickInterval,
 	})
 	if err != nil {
@@ -120,7 +171,7 @@ func runServe(args []string) error {
 	if err := srv.Serve(); err != nil {
 		return err
 	}
-	fmt.Printf("quorum node %d listening on %s (peers: %v)\n", *id, srv.Addr(), ids)
+	fmt.Printf("quorum node %d listening on %s (voters: %v, known addresses: %v)\n", *id, srv.Addr(), config, ids)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -195,6 +246,75 @@ func propose(addr string, data []byte) error {
 		return fmt.Errorf("not the leader; current leader is node %d", reply.LeaderHint)
 	}
 	fmt.Println("ok")
+	return nil
+}
+
+// membersArgs/membersReply and changeArgs/changeReply mirror the reply shapes
+// on server.rpcFacade's Members and ChangeMembership RPCs; see the note on
+// proposeReply for why they are declared here rather than imported.
+type membersArgs struct{}
+type membersReply struct {
+	Voters   []uint64
+	Outgoing []uint64
+	Leader   uint64
+	Role     string
+}
+
+type changeArgs struct{ Voters []uint64 }
+type changeReply struct {
+	Index      uint64
+	LeaderHint uint64
+	Err        string
+}
+
+// runMembers prints the cluster's membership, or changes it when -voters is
+// given. Reading is answerable by any node (it reports that node's own view);
+// changing it has to go to the leader, same as a put.
+func runMembers(args []string) error {
+	fs := flag.NewFlagSet("members", flag.ExitOnError)
+	addr := fs.String("addr", "", "address of any node in the cluster")
+	voters := fs.String("voters", "", "if set, the comma-separated node ids the cluster should consist of after the change")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *addr == "" {
+		return fmt.Errorf("members requires -addr")
+	}
+	c, err := dial(*addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if *voters == "" {
+		var reply membersReply
+		if err := c.Call("Node.Members", membersArgs{}, &reply); err != nil {
+			return err
+		}
+		if len(reply.Outgoing) > 0 {
+			fmt.Printf("voters: %v (a change is in progress: leaving %v)\n", reply.Voters, reply.Outgoing)
+		} else {
+			fmt.Printf("voters: %v\n", reply.Voters)
+		}
+		fmt.Printf("this node: %s, leader: %d\n", reply.Role, reply.Leader)
+		return nil
+	}
+
+	target, err := parseIDs(*voters)
+	if err != nil {
+		return err
+	}
+	var reply changeReply
+	if err := c.Call("Node.ChangeMembership", changeArgs{Voters: target}, &reply); err != nil {
+		return err
+	}
+	if reply.Err != "" {
+		if reply.LeaderHint != raft.None {
+			return fmt.Errorf("membership change rejected: %s (current leader is node %d)", reply.Err, reply.LeaderHint)
+		}
+		return fmt.Errorf("membership change rejected: %s", reply.Err)
+	}
+	fmt.Printf("ok: configuration %v agreed at log index %d\n", target, reply.Index)
 	return nil
 }
 

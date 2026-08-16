@@ -142,3 +142,53 @@ func TestCheckPartitionsIndependentlyByKey(t *testing.T) {
 		t.Error("key y's history is valid and must be reported as linearizable")
 	}
 }
+
+// The three tests below pin the InDoubt semantics added in 60d37d2. Before
+// it, the chaos harness dropped a timed-out write from the history entirely,
+// which is unsound in both directions; these cover both directions plus the
+// case that must still fail, so "treat in-doubt as optional" cannot decay
+// into "ignore in-doubt operations".
+
+// Direction one: a write that timed out and then committed anyway. The client
+// never learned it landed, but a later read sees its value. Dropping the write
+// makes that read look like a read of a value never written — a false
+// violation. As an optional operation it linearizes cleanly.
+func TestInDoubtWriteCanExplainALaterRead(t *testing.T) {
+	ops := []Op{
+		{Client: 1, Key: "x", Type: OpPut, Call: at(0), Return: at(1), Value: []byte("v1"), InDoubt: true},
+		{Client: 2, Key: "x", Type: OpGet, Call: at(4), Return: at(5), ResultFound: true, ResultValue: []byte("v1")},
+	}
+	if res := CheckKey("x", ops); !res.Linearizable {
+		t.Fatal("a read explained by an in-doubt write that did commit must be accepted; dropping the write would report a false violation")
+	}
+}
+
+// Direction two: the same in-doubt write, but nothing ever observes it. A
+// linearization is free to leave it out, so a read that sees the earlier
+// value is equally valid. Both explanations are things that could really
+// have happened, and the checker must accept either.
+func TestInDoubtWriteMayAlsoBeLeftOutEntirely(t *testing.T) {
+	ops := []Op{
+		{Client: 1, Key: "x", Type: OpPut, Call: at(0), Return: at(1), Value: []byte("v0")},
+		{Client: 2, Key: "x", Type: OpPut, Call: at(2), Return: at(3), Value: []byte("v1"), InDoubt: true},
+		{Client: 3, Key: "x", Type: OpGet, Call: at(4), Return: at(5), ResultFound: true, ResultValue: []byte("v0")},
+	}
+	if res := CheckKey("x", ops); !res.Linearizable {
+		t.Fatal("an in-doubt write that never committed must be allowed to be left out of the linearization")
+	}
+}
+
+// And the guard: optional does not mean unconstrained. An in-doubt write may
+// be placed at or after its Call, never before it, so it cannot be used to
+// explain a read that completed before the write was ever submitted. Without
+// this the InDoubt relaxation would mask real violations rather than only
+// removing false ones.
+func TestInDoubtWriteCannotExplainAReadThatPrecededIt(t *testing.T) {
+	ops := []Op{
+		{Client: 1, Key: "x", Type: OpGet, Call: at(0), Return: at(1), ResultFound: true, ResultValue: []byte("v1")},
+		{Client: 2, Key: "x", Type: OpPut, Call: at(4), Return: at(5), Value: []byte("v1"), InDoubt: true},
+	}
+	if res := CheckKey("x", ops); res.Linearizable {
+		t.Fatal("an in-doubt write must not be usable to explain a read that finished before the write was even submitted")
+	}
+}

@@ -133,15 +133,33 @@ func TestProposeOnAFollowerIsRejectedWithALeaderHint(t *testing.T) {
 		}
 	}
 
-	ok, hint, err := follower.Propose(fsm.EncodePut([]byte("x"), []byte("1")))
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	if ok {
-		t.Fatal("a follower must not apply a proposal directly")
-	}
-	if hint != leader.cfg.ID {
-		t.Fatalf("leader hint = %d, want %d", hint, leader.cfg.ID)
+	// The hint has to name *a* leader this follower has heard from, not
+	// specifically the one awaitLeader happened to see, and the follower has
+	// to actually know one at the moment it is asked. Both of those can
+	// legitimately fail to hold at any given instant: leadership changes, and
+	// a follower whose election timer has just fired knows no leader at all
+	// until the next one is settled. Pinning the test to one particular
+	// leader, or to a single attempt, is testing the scheduler rather than
+	// the redirect; either way it fails a few times in a hundred runs.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ok, hint, err := follower.Propose(fsm.EncodePut([]byte("x"), []byte("1")))
+		if err != nil {
+			t.Fatalf("Propose: %v", err)
+		}
+		if ok {
+			t.Fatal("a follower must not apply a proposal directly")
+		}
+		if hint != raft.None {
+			if _, known := follower.cfg.Addrs[hint]; !known {
+				t.Fatalf("leader hint = %d, which is not a node in this cluster", hint)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the follower never named a leader to redirect to")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -1,18 +1,12 @@
-// Package checker is quorum's linearizability checker (design doc §6, layer
-// 3, milestone M6): given a recorded history of client operations against a
-// running cluster, it decides whether that history could have come from a
-// single, unshared, sequential key-value store — the property the whole rest
-// of the system exists to provide.
+// Package checker is quorum's linearizability checker (docs/DESIGN.md §6,
+// milestone M6): given a recorded history of client operations, it decides
+// whether that history could have come from a single sequential key-value
+// store.
 //
-// The design's guarantee is deliberately scoped to single-key linearizability
-// (docs/DESIGN.md §3, §7: no multi-key transactions), so this checker does
-// not need general multi-object linearizability search. Each key's
-// sub-history is checked independently as a single linearizable register,
-// which is the classical, much cheaper Wing–Gong problem: does there exist a
-// total order of the operations on this key, consistent with the real-time
-// order they were observed to occur in (an operation that finished before
-// another started must precede it), under which every read returns the value
-// most recently written?
+// The guarantee is scoped to single-key linearizability (docs/DESIGN.md §3,
+// §7), so each key's sub-history is checked independently as one register —
+// the classical Wing–Gong problem — rather than by a general multi-object
+// search.
 package checker
 
 import (
@@ -62,16 +56,29 @@ type Op struct {
 	// have happened, not for any return value.
 	ResultFound bool
 	ResultValue []byte
+
+	// InDoubt marks an operation the client submitted but never learned the
+	// outcome of — Jepsen's ":info" case. It is checked as *optional*: a
+	// linearization may place it anywhere at or after its Call, or leave it
+	// out entirely, because both are things that could really have happened.
+	// Return is ignored, since there was no return. Dropping such an
+	// operation from the history instead is unsound in both directions; see
+	// docs/BUGS.md §4 and §5.
+	InDoubt bool
 }
 
 func (op Op) String() string {
+	doubt := ""
+	if op.InDoubt {
+		doubt = " [in doubt: outcome never observed]"
+	}
 	switch op.Type {
 	case OpGet:
-		return fmt.Sprintf("client%d: Get(%q) -> found=%v value=%q", op.Client, op.Key, op.ResultFound, op.ResultValue)
+		return fmt.Sprintf("client%d: Get(%q) -> found=%v value=%q%s", op.Client, op.Key, op.ResultFound, op.ResultValue, doubt)
 	case OpPut:
-		return fmt.Sprintf("client%d: Put(%q, %q)", op.Client, op.Key, op.Value)
+		return fmt.Sprintf("client%d: Put(%q, %q)%s", op.Client, op.Key, op.Value, doubt)
 	default:
-		return fmt.Sprintf("client%d: Delete(%q)", op.Client, op.Key)
+		return fmt.Sprintf("client%d: Delete(%q)%s", op.Client, op.Key, doubt)
 	}
 }
 
@@ -113,25 +120,20 @@ type Result struct {
 }
 
 // CheckKey decides whether ops — every recorded operation on a single key —
-// admits a linearization. It explores linearizations with backtracking:
-// exactly the classical Wing–Gong search, pruned two ways — an operation can
-// only be placed next if no not-yet-placed operation is real-time-forced to
-// precede it (its Return already happened before this op's Call), and a
-// (remaining-set, resulting-state) pair that has already been shown to have
-// no completion is never re-explored.
+// admits a linearization, by the classical Wing–Gong backtracking search
+// pruned two ways: an operation may only be placed next if no unplaced
+// operation is real-time-forced to precede it (isMinimal), and a
+// (remaining-set, state) pair already shown to have no completion is never
+// re-explored.
 //
-// This is exponential in the number of concurrent (real-time-overlapping)
-// operations in the worst case — inherent to the problem, not a shortcut
-// taken here — so CheckKey is meant for the tens-of-operations-per-key scale
-// a test or a bounded chaos run produces, not for auditing a production
-// history unbounded in size.
+// Worst case it is exponential in the number of overlapping operations —
+// inherent to the problem — so it is meant for the tens-of-ops-per-key scale
+// a bounded chaos run produces, not an unbounded production history.
 func CheckKey(key string, ops []Op) Result {
 	n := len(ops)
 	if n > 63 {
-		// A uint64 bitmask covers at most 63 ops (bit 63 reserved by no one
-		// in particular; keeping one bit of headroom rather than relying on
-		// exact 64-bit overflow behavior). Callers checking larger histories
-		// should batch by time window instead of extending this type.
+		// The placed-set is a uint64 bitmask; batch larger histories by time
+		// window rather than widening it.
 		panic(fmt.Sprintf("checker: CheckKey(%q): %d ops exceeds the 63-op limit for a single check", key, n))
 	}
 
@@ -141,11 +143,21 @@ func CheckKey(key string, ops []Op) Result {
 	}
 	unsolvable := map[memoKey]bool{}
 
+	// required is the set of operations a linearization must account for.
+	// In-doubt operations are excluded: the client never learned whether they
+	// took effect, so a linearization that leaves one out is just as faithful
+	// an explanation of what happened as one that includes it.
+	var required uint64
+	for i, op := range ops {
+		if !op.InDoubt {
+			required |= uint64(1) << uint(i)
+		}
+	}
+
 	order := make([]int, 0, n)
 	var search func(state register, mask uint64) bool
 	search = func(state register, mask uint64) bool {
-		full := uint64(1)<<uint(n) - 1
-		if mask == full {
+		if mask&required == required {
 			return true
 		}
 		mk := memoKey{mask: mask, state: state}
@@ -177,7 +189,9 @@ func CheckKey(key string, ops []Op) Result {
 	ok := search(register{}, 0)
 	res := Result{Key: key, Linearizable: ok, OpCount: n}
 	if ok {
-		res.Witness = make([]Op, n)
+		// The witness may be shorter than ops: any in-doubt operation the
+		// search chose to leave out is not part of this explanation.
+		res.Witness = make([]Op, len(order))
 		for i, idx := range order {
 			res.Witness[i] = ops[idx]
 		}
@@ -185,46 +199,33 @@ func CheckKey(key string, ops []Op) Result {
 	return res
 }
 
-// isMinimal reports whether ops[i] is legal to linearize next given that
-// every op whose bit is set in mask has already been placed: true exactly
-// when no other not-yet-placed operation's Return happened strictly before
-// ops[i]'s Call, which would force that operation to precede this one.
+// isMinimal reports whether ops[i] may be linearized next given that every op
+// whose bit is set in mask is already placed: true exactly when no unplaced
+// operation's Return happened strictly before ops[i]'s Call.
 //
-// The comparison is strict (Before, not "<=") deliberately: two operations
-// whose recorded Call/Return land on the exact same instant are treated as
-// concurrent rather than forced into an order. A wall clock's real
-// resolution is finite — two calls to time.Now() with nothing but a fast
-// function call between them can legitimately read back equal — so an op
-// pair with tied timestamps in both directions is not evidence they truly
-// happened simultaneously, only that the clock couldn't distinguish them.
-// A non-strict "j.Return <= i.Call" check breaks on exactly this case: two
-// tied ops X and Y each look, from the other's perspective, like they must
-// precede it, so neither is ever eligible and a real linearization the
-// history actually admits is missed. Treating ties as concurrent (either
-// order allowed) is the correct, standard resolution, and it only ever
-// widens the search — it can never turn a true violation into a false pass,
-// since a genuine violation isn't fixed by which of two tied operations goes
-// first.
+// The comparison must stay strict. Tied Call/Return instants are routine on a
+// finite-resolution clock, and a non-strict "<=" makes two tied ops each look
+// forced before the other, an ordering cycle that hides real linearizations.
+// See docs/BUGS.md §1.
 func isMinimal(ops []Op, mask uint64, i int) bool {
 	for j := range ops {
 		if j == i || mask&(uint64(1)<<uint(j)) != 0 {
 			continue
 		}
+		if ops[j].InDoubt {
+			// j never returned, so it may still be pending: nothing forces it
+			// to precede anything.
+			continue
+		}
 		if ops[j].Return.Before(ops[i].Call) {
-			// j is real-time-forced to precede i (finished strictly before i
-			// started) but hasn't been placed yet: i cannot go next.
 			return false
 		}
-		// Otherwise ops[j].Return is equal to or after ops[i].Call — a tied
-		// instant (treated as concurrent, not a forced order) or a genuine
-		// overlap — so j does not block i.
 	}
 	return true
 }
 
-// Recorder collects Ops from any number of concurrent callers — the shape a
-// chaos test's client goroutines naturally produce — and hands back a stable
-// snapshot for Check once the run is over.
+// Recorder collects Ops from any number of concurrent callers and hands back
+// a stable snapshot for Check once the run is over.
 type Recorder struct {
 	mu  sync.Mutex
 	ops []Op
@@ -247,10 +248,9 @@ func (r *Recorder) Ops() []Op {
 	return append([]Op(nil), r.ops...)
 }
 
-// Check partitions a full history by key and runs CheckKey on each,
-// independently — sound because the design's guarantee (docs/DESIGN.md §3)
-// is single-key linearizability, so one key's history can never be forced
-// inconsistent by another key's operations.
+// Check partitions a full history by key and runs CheckKey on each. Checking
+// keys independently is sound because the guarantee is single-key
+// linearizability (docs/DESIGN.md §3).
 func Check(history []Op) []Result {
 	byKey := map[string][]Op{}
 	var keys []string

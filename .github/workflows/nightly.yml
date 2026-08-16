@@ -1,0 +1,88 @@
+name: Nightly
+
+# The heavy verification runs. These are too slow for every push — the soak
+# alone is several minutes and the benchmarks are several more — so they run on
+# a schedule instead of being left as something a human remembers to do
+# manually. `workflow_dispatch` is there so a run can be triggered by hand
+# after a change that warrants it without waiting for the schedule.
+on:
+  schedule:
+    # 03:30 UTC daily.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  soak:
+    name: randomized linearizability soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+
+      # 200 randomized schedules, alternating 3- and 5-node clusters, with
+      # partitions across random groupings, a lossy network, and crash-restart
+      # of a random node mid-write. Run under -race: a data race in the server
+      # loop is exactly the kind of defect a chaos run is well placed to
+      # trigger and a unit test is not.
+      #
+      # The seed base is fixed rather than randomized so a failure is
+      # reproducible from the log alone. A single failing schedule can be
+      # re-run with:
+      #   go test ./internal/server/ -run TestLinearizabilitySoak -quorum.soak \
+      #     -quorum.soak.seedbase=<seed> -quorum.soak.seeds=1 -v
+      - name: Soak
+        run: |
+          go test ./internal/server/ \
+            -run TestLinearizabilitySoak \
+            -quorum.soak -quorum.soak.seeds=200 -quorum.soak.seedbase=70000 \
+            -race -v -timeout 55m
+
+  measure:
+    name: election timing and partition heal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+
+      # These are measurements, not assertions, but they still fail if the
+      # cluster stops recovering from a killed leader or if the majority side
+      # of a partition stops committing — which is the part worth guarding.
+      #
+      # The timings produced here are NOT the numbers in docs/BENCHMARKS.md and
+      # must not be copied into it: a shared CI runner is not a controlled
+      # environment. BENCHMARKS.md records a specific machine, named in the
+      # document, and is regenerated deliberately with bench/run.sh.
+      - name: Measurement harness
+        run: |
+          go test ./internal/server/ \
+            -run 'TestMeasureElectionTime|TestMeasurePartitionHealThroughput' \
+            -quorum.measure -quorum.trials=25 -v -timeout 25m
+
+  repeat:
+    name: full suite, repeated
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+
+      # The README claims the suite passes under -race "repeatedly". This is
+      # the thing that checks that claim rather than trusting it. Timing-
+      # dependent flakes in the election and chaos tests would show up here
+      # first.
+      - name: Suite x5
+        run: go test ./... -race -count=5 -timeout 25m
