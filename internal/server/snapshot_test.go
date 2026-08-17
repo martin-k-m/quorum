@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/martin-k-m/quorum/internal/checker"
 	"github.com/martin-k-m/quorum/internal/fsm"
+	"github.com/martin-k-m/quorum/internal/raft"
 )
 
 // compactingCluster is cluster with a snapshot threshold and stable data
@@ -79,7 +81,7 @@ func awaitStatus(t *testing.T, s *Server, timeout time.Duration, ok func(Status)
 // bound. Writing well past the threshold must leave a log smaller than the
 // writes that went through it.
 func TestLogStopsGrowingOnceCompactionIsOn(t *testing.T) {
-	servers, _, dirs := compactingCluster(t, 3, 19400, 32)
+	servers, _, dirs := compactingCluster(t, 3, 19800, 32)
 	leader := awaitLeader(t, servers, 5*time.Second)
 
 	value := make([]byte, 512)
@@ -113,7 +115,7 @@ func TestLogStopsGrowingOnceCompactionIsOn(t *testing.T) {
 // caught up from the log, because the entries it needs no longer exist. The
 // only way back is a snapshot.
 func TestFollowerBehindTheCompactionPointCatchesUpBySnapshot(t *testing.T) {
-	servers, _, _ := compactingCluster(t, 3, 19420, 24)
+	servers, _, _ := compactingCluster(t, 3, 19810, 24)
 	leader := awaitLeader(t, servers, 5*time.Second)
 
 	var follower *Server
@@ -179,7 +181,7 @@ func TestFollowerBehindTheCompactionPointCatchesUpBySnapshot(t *testing.T) {
 // performed, because the whole log had to be replayed.
 func TestRestartFromSnapshotKeepsStateAndAShortLog(t *testing.T) {
 	ids := []uint64{1}
-	addrs := map[uint64]string{1: "127.0.0.1:19440"}
+	addrs := map[uint64]string{1: "127.0.0.1:19820"}
 	dir := t.TempDir()
 
 	srv := startNode(t, 1, ids, addrs, dir, 16)
@@ -241,7 +243,7 @@ func TestRestartFromSnapshotKeepsStateAndAShortLog(t *testing.T) {
 // compacted past its own configuration entry and then fell back to the
 // bootstrap configuration would count the wrong set of voters toward a quorum.
 func TestMembershipSurvivesCompactionAcrossACluster(t *testing.T) {
-	servers, _, _ := compactingCluster(t, 3, 19460, 16)
+	servers, _, _ := compactingCluster(t, 3, 19830, 16)
 	leader := awaitLeader(t, servers, 5*time.Second)
 
 	// Remove a node that is not the leader. Removing the leader makes it step
@@ -260,8 +262,23 @@ func TestMembershipSurvivesCompactionAcrossACluster(t *testing.T) {
 			keep = append(keep, s.cfg.ID)
 		}
 	}
-	if _, _, err := leader.ChangeMembership(keep); err != nil {
-		t.Fatalf("ChangeMembership: %v", err)
+	// A leader may not begin a membership change until it has committed an entry
+	// in its own term, so a change proposed immediately after an election can
+	// legitimately be refused. Retry rather than treat that as a failure: the
+	// alternative is a test that fails whenever the election is fast.
+	deadline := time.Now().Add(10 * time.Second)
+	var changeErr error
+	for time.Now().Before(deadline) {
+		if _, _, changeErr = leader.ChangeMembership(keep); changeErr == nil {
+			break
+		}
+		if !errors.Is(changeErr, raft.ErrLeaderNotReady) {
+			t.Fatalf("ChangeMembership: %v", changeErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if changeErr != nil {
+		t.Fatalf("ChangeMembership never became ready: %v", changeErr)
 	}
 	awaitStatus(t, leader, 10*time.Second, func(st Status) bool {
 		return !st.Config.IsJoint() && len(st.Config.Voters) == 2
@@ -287,7 +304,7 @@ func TestMembershipSurvivesCompactionAcrossACluster(t *testing.T) {
 // Compaction is off unless asked for, so a caller that wants the whole log
 // still gets it.
 func TestCompactionIsOffByDefault(t *testing.T) {
-	servers := cluster(t, 1, 19480)
+	servers := cluster(t, 1, 19840)
 	leader := awaitLeader(t, servers, 5*time.Second)
 	for i := 0; i < 100; i++ {
 		if ok, _, err := leader.Propose(fsm.EncodePut([]byte("k"), []byte("v"))); err != nil || !ok {
@@ -322,7 +339,7 @@ func TestLinearizabilityWithCompactionOn(t *testing.T) {
 	for i := 0; i < schedules; i++ {
 		seed := int64(seedBase + i)
 		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
-			ops := runSchedule(t, seed, 19500+i*10, threshold)
+			ops := runSchedule(t, seed, 19850+i*4, threshold)
 			if ops == nil {
 				t.Skip("no leader")
 			}
