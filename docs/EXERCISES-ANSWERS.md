@@ -140,7 +140,7 @@ to remember. Measured on one node over 20,000 writes, 5,889,055 bytes of log
 becomes 53,862 bytes of log plus snapshot and the log-replay half of a restart
 drops from 97 ms to 10 ms (`BENCHMARKS.md`). The check that mattered was not that
 the log got shorter but that nothing was lost: the chaos schedules re-run with
-compaction on give 3,000 operations and 0 violations. Reasoning in
+compaction on give 950 operations and 0 violations. Reasoning in
 `DECISIONS.md` §2.
 
 **9. (design) Batching.**

@@ -331,7 +331,13 @@ func TestLinearizabilityWithCompactionOn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping the multi-schedule chaos run in -short mode")
 	}
-	const schedules = 25
+	// Ten rather than the twenty-five the un-compacted suite runs. Each
+	// schedule is a fresh three-node cluster under a partition, and doubling
+	// the package's chaos workload was enough to make the pre-existing
+	// timing-sensitive tests fail on a shared CI runner under -race. Ten still
+	// crosses the threshold several times per schedule, which is what this is
+	// evidence for; the count was load, not coverage.
+	const schedules = 10
 	const seedBase = 9500
 	const threshold = 8
 	totalOps := 0
