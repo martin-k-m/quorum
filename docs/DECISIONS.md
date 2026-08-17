@@ -244,23 +244,48 @@ requires a consensus round to be reachable again. The cost is a stated
 limitation: a node can only be added to a running cluster if the other nodes
 were already started knowing how to reach it. There is no discovery mechanism.
 
-## 8. A node being added joins as a full voter immediately, with no catch-up phase
+## 8. A node being added joins as a learner first, and is promoted once it can help
 
-When a node is added, it becomes a voting member the moment the configuration
-entry is appended, with an empty log.
+This used to say a node became a voter the moment the configuration entry was
+appended, with an empty log, and that the resulting availability dip was the
+clearest single item of remaining work. The dip is worth restating because it is
+counterintuitive: growing a 3-node cluster to 4 did not immediately improve
+fault tolerance, it temporarily *reduced* it. The new configuration needs 3 of 4
+to commit, and one of those 4 was a node with an empty log that could not help,
+so during the catch-up window the cluster tolerated zero failures instead of
+one. Never a safety cost, since joint consensus held throughout and nothing
+incorrect could commit; it just might commit nothing at all for a while.
 
-The alternative is a learner (non-voting) phase: the new node replicates until
-it has caught up, and only then is promoted to voter. Production Raft
-implementations do this.
+A learner is now a third kind of member: replicated to, counted in no quorum,
+casting no vote. `Server.AddNode` adds the node as a learner, waits for it to
+replicate, and only then proposes the voter-set change.
 
-It lost to scope; it is the clearest single item of remaining work. The cost is
-an availability dip, and it is worth being precise about it because it is
-counterintuitive: growing a 3-node cluster to 4 does not immediately improve
-fault tolerance, it temporarily *reduces* it. The new configuration needs 3 of
-4 to commit, and one of those 4 is a node with an empty log that cannot help
-until it catches up — so during the catch-up window the cluster tolerates zero
-failures instead of one. This is an availability cost and never a safety one:
-the joint-consensus rules hold throughout, so nothing incorrect can commit. It
-just may fail to commit anything at all for a while. There is also no
-leadership transfer, so a graceful "step down before I am removed" is not
-available either.
+**Adding a learner deliberately does not use joint consensus.** Joint consensus
+exists because changing the voter set changes what a majority is, and two
+configurations that disagree about that can elect two leaders in one term. A
+learner is in neither majority before nor after, so the quorum for every
+decision is byte-identical on both sides of the entry and there is nothing for
+the halves to disagree about. Promotion is an ordinary voter-set change and does
+go through joint consensus, as it must.
+
+**The split is between replication and counting, not between two node lists.**
+`Configuration.All` is every voting node and answers every quorum question;
+`Configuration.Replicas` adds the learners and is what the leader iterates when
+it sends. Before learners there was no reason to ask those separately, and
+conflating them is exactly how a learner would end up in a quorum.
+
+**Promotion takes a tolerance, not an equality test.** "Caught up" is a
+judgement call rather than a fact: the leader's last index keeps moving while
+the cluster takes writes, so a strict equality test can fail forever on a busy
+cluster. The caller says how many entries of lag it will accept at the moment of
+promotion.
+
+**Learners travel through the configuration entry, and the encoding stayed
+backward compatible.** The learner list is appended after the existing two
+rather than given a header field, so a configuration entry written before
+learners existed still decodes: those payloads simply end where the learner
+count would begin. A new header field would have changed the meaning of every
+byte after it, and a node replaying an older log would have panicked on it.
+
+Still not done: there is no leadership transfer, so a graceful "step down before
+I am removed" is unavailable and removing a leader still costs one election.
