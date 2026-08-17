@@ -47,6 +47,18 @@ go test ./internal/server/ \
   | tee "$OUT/partition-heal.txt"
 
 echo
+echo "=== batching on vs off (3 nodes) ==="
+# Both arms from this same session, so the comparison is not across machines.
+{
+  echo "--- un-batched (MaxBatchSize=1) ---"
+  go test ./internal/server/ -run '^$' -bench 'BenchmarkWrite/nodes=3' \
+    -benchtime 2000x -count 3 -quorum.batch=1 -timeout 60m
+  echo "--- batched (default) ---"
+  go test ./internal/server/ -run '^$' -bench 'BenchmarkWrite/nodes=3' \
+    -benchtime 2000x -count 3 -timeout 60m
+} | tee "$OUT/batching.txt"
+
+echo
 echo "=== log compaction: disk and restart, with and without (3 runs) ==="
 # Three separate invocations rather than -count=3, so each run gets a fresh
 # temp directory; the whole point is measuring what a node left on disk.

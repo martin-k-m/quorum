@@ -9,8 +9,8 @@ bench/run.sh              # Linux/macOS, or Git Bash on Windows
 ```
 
 Raw output is written to `bench/results/` (gitignored): `throughput.txt`,
-`election.txt`, `partition-heal.txt`, `compaction.txt`, `write-cpu.prof`,
-`write-cpu-top.txt`, and `env.txt`.
+`election.txt`, `partition-heal.txt`, `batching.txt`, `compaction.txt`,
+`write-cpu.prof`, `write-cpu-top.txt`, and `env.txt`.
 
 ## What lives where
 
