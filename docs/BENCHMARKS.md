@@ -302,8 +302,8 @@ ceiling: the remaining serialization is the un-pipelined replication round trip,
 which batching does not touch.
 
 Correctness under batching is checked by the same three linearizability suites,
-which run with it on by default: 3,000 fault-injected operations, 3,000 with
-compaction also on, and 2,360 across membership changes, 0 violations in any.
+which run with it on by default: 3,000 fault-injected operations, 1,200 with
+compaction also on, and 2,400 across membership changes, 0 violations in any.
 
 Reasoning in [DECISIONS.md](DECISIONS.md) §4.
 
