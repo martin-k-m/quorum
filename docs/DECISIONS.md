@@ -180,7 +180,7 @@ At 1 client there is nothing to batch and the numbers are unchanged, which is
 the result that says the drain is not doing anything clever behind the scenes.
 
 The three linearizability suites all run with batching on by default now:
-3,000 operations fault-injected, 3,000 with compaction on, 2,360 across
+3,000 operations fault-injected, 1,200 with compaction also on, 2,400 across
 membership changes, 0 violations in any of them.
 
 **Pipelining is still not built.** `AppendEntries` to a follower is not sent
