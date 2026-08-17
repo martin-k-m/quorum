@@ -243,21 +243,58 @@ than a single post-heal average would need a longer run and is not done here.
 The important correctness observation is that the minority side committed
 nothing throughout, which the harness asserts.
 
-## Batching and pipelining
+## Batching
 
-**`quorum` implements neither.** This is a plain statement of what the code
-does, not a caveat:
+The event loop drains whatever proposals have already queued and commits them
+with one log write and one `fsync`. On by default, capped at 64.
 
-- **No batching.** The server's event loop handles one client proposal per
-  iteration of its `select`, and each one calls `Storage.AppendEntries`, which
-  issues its own `fsync`. Several proposals arriving together are not coalesced
-  into one log write and one sync.
-- **No pipelining.** `AppendEntries` to a follower is not sent ahead of the
-  previous one's acknowledgement.
+**Pipelining is still not implemented.** `AppendEntries` to a follower is not
+sent ahead of the previous one's acknowledgement, so everything below is
+measured with the replication round trips still serialized.
 
-There is consequently no "optimization on vs off" comparison to present. The
-tables above *are* the off case, and there is no on case to compare them
-against. Reasoning in [DECISIONS.md](DECISIONS.md) §4.
+Both arms come from the same harness in the same session on the machine
+described above, 3 nodes, `-benchtime 2000x -count 3`, median of the three.
+`-quorum.batch=1` produces the un-batched column; the default produces the
+other. Comparing against the tables further up this page instead would be
+comparing two different sessions.
+
+### Throughput
+
+| Concurrent clients | Un-batched | Batched | Change |
+|---:|---:|---:|---:|
+| 1 | 694 writes/s | 728 writes/s | 1.05x |
+| 4 | 866 writes/s | 1,006 writes/s | 1.16x |
+| 16 | 861 writes/s | 2,892 writes/s | 3.4x |
+| 64 | 849 writes/s | 7,623 writes/s | 9.0x |
+
+### Latency, as one client experienced it
+
+| Concurrent clients | p50 un-batched | p50 batched | p99 un-batched | p99 batched |
+|---:|---:|---:|---:|---:|
+| 1 | 1.46 ms | 1.31 ms | 3.68 ms | 3.82 ms |
+| 4 | 4.46 ms | 3.84 ms | 11.07 ms | 8.06 ms |
+| 16 | 17.97 ms | 5.17 ms | 27.08 ms | 10.18 ms |
+| 64 | 73.00 ms | 6.86 ms | 121.30 ms | 18.43 ms |
+
+**Throughput now scales with concurrency instead of being flat**, which was the
+finding the un-batched tables above exist to record. Throughput and latency
+improve together, which is the expected shape rather than a surprise: the old
+latency was queueing behind a serialized `fsync`, so draining the queue removes
+both the ceiling and the wait.
+
+**At 1 client nothing changes**, within run-to-run noise. There is nothing to
+batch at that concurrency, and a drain that produced a difference there would
+mean it was doing something other than what it claims.
+
+The 9.0x at 64 clients is a floor for what batching is worth on this path, not a
+ceiling: the remaining serialization is the un-pipelined replication round trip,
+which batching does not touch.
+
+Correctness under batching is checked by the same three linearizability suites,
+which run with it on by default: 3,000 fault-injected operations, 3,000 with
+compaction also on, and 2,360 across membership changes, 0 violations in any.
+
+Reasoning in [DECISIONS.md](DECISIONS.md) §4.
 
 ## Log compaction
 
