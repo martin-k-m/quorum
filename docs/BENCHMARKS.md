@@ -5,13 +5,21 @@ the machine described below. The invocations are recorded so they can be
 re-run; nothing here is estimated, extrapolated, or carried over from another
 machine.
 
-The short version: **`quorum` commits roughly 500-600 writes per second on a
-3-node cluster and that number does not improve with client concurrency.**
-Latency grows almost exactly linearly with concurrency while throughput stays
-flat, which is the signature of a serialized resource. A CPU profile identifies
-it precisely: 82% of all samples are inside a single `fsync`. There is one
-fsync per log entry and no batching, so the write path is disk-sync-bound and
-concurrency only adds queueing delay.
+The short version: **the write path is disk-sync-bound**, and a CPU profile says
+so precisely: 82% of all samples are inside a single `fsync`.
+
+That used to mean throughput was flat at roughly 500-600 writes/s on a 3-node
+cluster no matter how many clients offered work, while latency grew almost
+linearly with concurrency, which is the signature of a serialized resource.
+Proposals are now batched into one log write and one `fsync`, and throughput
+scales with concurrency instead: **728 writes/s at 1 client, 7,623 at 64**, with
+p50 latency falling rather than rising. See [Batching](#batching).
+
+The per-configuration tables in the next two sections predate batching and are
+the un-batched baseline. They are kept because the batching comparison is read
+against them, and because the profile that explains the whole page was taken on
+that path. The batching section states both arms explicitly and both were
+measured in one session; do not compare a number there against a number here.
 
 ---
 
@@ -128,12 +136,15 @@ fsynced by every node that accepts it, committed on a majority, and applied.
 | 16 | 474 writes/s | 30.50 ms | 77.79 ms | 101.4 ms |
 | 64 | 441 writes/s | 140.00 ms | 271.80 ms | 291.2 ms |
 
-**Throughput is flat.** Going from 1 to 64 concurrent clients — 64× the offered
-load — moves 3-node throughput from 506/s to 612/s, about 1.2×. Over the same
-range p50 latency goes from 1.58 ms to 96.21 ms, about 61×. Sixty-four clients
-do not get more work done; they get in line. Latency × throughput is
-approximately constant, which is Little's Law describing a queue in front of a
-single server.
+**Throughput is flat here, un-batched.** Going from 1 to 64 concurrent clients
+— 64× the offered load — moves 3-node throughput from 506/s to 612/s, about
+1.2×. Over the same range p50 latency goes from 1.58 ms to 96.21 ms, about 61×.
+Sixty-four clients do not get more work done; they get in line. Latency ×
+throughput is approximately constant, which is Little's Law describing a queue
+in front of a single server.
+
+This is the finding batching was built to address, and [Batching](#batching)
+measures what it moved. The tables above are the baseline it is read against.
 
 Five nodes cost roughly 30% of the three-node throughput. Part of that is the
 larger quorum and the two extra sets of `AppendEntries` RPCs; part is the

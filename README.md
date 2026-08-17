@@ -130,9 +130,12 @@ done — a runnable cluster with its correctness checked, not just asserted:
   (median and p99), election-time distribution over 25 trials, and
   partition-heal behaviour, with the environment and exact commands recorded.
   Regenerate every number with [`bench/run.sh`](bench) or `bench\run.ps1`.
-  The headline: ~500-600 writes/s on 3 nodes, **flat regardless of client
-  concurrency**, because there is one `fsync` per log entry and no batching.
-  A CPU profile puts 82% of all samples inside that single `fsync`.
+  The headline: the write path is `fsync`-bound, with a CPU profile putting 82%
+  of all samples inside a single `fsync`. Throughput used to be flat at
+  ~500-600 writes/s regardless of client concurrency because there was one
+  `fsync` per log entry; batching proposals into one sync takes 3 nodes from
+  **728 writes/s at 1 client to 7,623 at 64**, with p50 latency falling rather
+  than rising.
 - **[docs/BUGS.md](docs/BUGS.md)** — the five real defects found so far, what
   caught each, and the regression test that pins it.
 - **[docs/DECISIONS.md](docs/DECISIONS.md)** — the choices that had a real
