@@ -23,7 +23,8 @@ new leader's began, which depends on bounded clock drift. The barrier's safety
 argument needs no clock at all, which means the checker can actually test it, and
 it did.
 
-**2. Flat throughput, linear latency.**
+**2. Flat throughput, linear latency.** (As measured before batching; see the
+end of this answer.)
 
 One `fsync` per log entry, with no batching. `f.Sync()` is 37.39 s of 45.65 s of
 samples in the write-path profile: **81.9% of all CPU time**. On Windows
@@ -31,11 +32,18 @@ samples in the write-path profile: **81.9% of all CPU time**. On Windows
 why `runtime.cgocall` sits at 85.5% flat at the top of the profile. The buffered
 `Write` before it costs 200 ms, about 0.5%.
 
-The event loop handles one client proposal per iteration of its `select` and each
-one calls `Storage.AppendEntries`, which issues its own sync. So the syncs
-serialize behind one event loop and one file. Sixty-four clients do not get more
-work done, they get in line: latency times throughput is approximately constant,
-which is Little's Law describing a queue in front of a single server.
+The event loop handled one client proposal per iteration of its `select` and each
+one called `Storage.AppendEntries`, which issued its own sync. So the syncs
+serialized behind one event loop and one file. Sixty-four clients did not get
+more work done, they got in line: latency times throughput is approximately
+constant, which is Little's Law describing a queue in front of a single server.
+
+The loop now drains the queued proposals and commits them with one sync, which
+is why the profile above still describes where the time goes but the flat
+throughput it explains is gone: 3 nodes now go from 728 writes/s at 1 client to
+7,623 at 64. The profile was taken on the un-batched path and is kept because it
+is what identifies the resource; batching changes how many entries cross one
+`fsync`, not what an `fsync` costs.
 
 An fsync is a durability barrier, not a bandwidth operation, so a fast NVMe does
 not help. 500 serial syncs per second is close to what the device gives.
