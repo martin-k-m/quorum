@@ -16,6 +16,10 @@ import (
 type Configuration struct {
 	Voters   []uint64
 	Outgoing []uint64 // non-empty only while a membership change is in flight
+	// Learners receive replication but count toward no quorum and cast no
+	// vote. A node joins here first so it can catch up without its empty log
+	// being counted as a member that cannot help; see docs/DECISIONS.md §8.
+	Learners []uint64
 }
 
 // IsJoint reports whether this configuration is the overlap configuration of
@@ -28,11 +32,29 @@ func (c Configuration) IsVoter(id uint64) bool {
 	return slices.Contains(c.Voters, id) || slices.Contains(c.Outgoing, id)
 }
 
-// All returns every node id in either half, deduplicated and sorted. Sorted
-// because any loop that produces messages must produce them in the same order
-// on every replay, or internal/testsim's reproducibility stops holding.
+// IsLearner reports whether id replicates without counting toward a quorum.
+func (c Configuration) IsLearner(id uint64) bool {
+	return slices.Contains(c.Learners, id)
+}
+
+// All returns every *voting* node id in either half, deduplicated and sorted.
+// This is the set every quorum question is asked about, so learners are
+// deliberately absent: a loop over All is a loop over nodes whose agreement
+// counts. Sorted because any loop that produces messages must produce them in
+// the same order on every replay, or internal/testsim's reproducibility stops
+// holding.
 func (c Configuration) All() []uint64 {
 	out := append(append([]uint64(nil), c.Voters...), c.Outgoing...)
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// Replicas returns every node the leader sends log entries to: the voters plus
+// the learners. The split from All is the whole learner mechanism. Replicating
+// to a node and counting its acknowledgement are different questions, and
+// before learners existed there was no reason to ask them separately.
+func (c Configuration) Replicas() []uint64 {
+	out := append(c.All(), c.Learners...)
 	slices.Sort(out)
 	return slices.Compact(out)
 }
@@ -102,26 +124,55 @@ func normalize(ids []uint64) []uint64 {
 	return slices.Compact(out)
 }
 
-// Equal reports whether two configurations name the same nodes in both halves.
+// without returns ids minus everything in drop, normalized. Used to keep a
+// node from being a learner and a voter at the same time, which would make it
+// count toward a quorum and also be excluded from one.
+func without(ids, drop []uint64) []uint64 {
+	out := make([]uint64, 0, len(ids))
+	for _, id := range normalize(ids) {
+		if !slices.Contains(drop, id) {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// Equal reports whether two configurations name the same nodes in every part.
 func (c Configuration) Equal(o Configuration) bool {
 	return slices.Equal(normalize(c.Voters), normalize(o.Voters)) &&
-		slices.Equal(normalize(c.Outgoing), normalize(o.Outgoing))
+		slices.Equal(normalize(c.Outgoing), normalize(o.Outgoing)) &&
+		slices.Equal(normalize(c.Learners), normalize(o.Learners))
 }
 
 func (c Configuration) String() string {
+	s := fmt.Sprintf("%v", normalize(c.Voters))
 	if c.IsJoint() {
-		return fmt.Sprintf("joint(new=%v, old=%v)", normalize(c.Voters), normalize(c.Outgoing))
+		s = fmt.Sprintf("joint(new=%v, old=%v)", normalize(c.Voters), normalize(c.Outgoing))
 	}
-	return fmt.Sprintf("%v", normalize(c.Voters))
+	if len(c.Learners) > 0 {
+		s += fmt.Sprintf(" learners=%v", normalize(c.Learners))
+	}
+	return s
 }
 
 // EncodeConfiguration serializes a Configuration into the Data of an
 // EntryConfChange log entry. The layout is explicit rather than gob or JSON
 // because these bytes go on disk and over the wire, and a fixed byte layout
 // cannot silently change meaning between versions.
+// Learners are appended after the original two lists rather than given a field
+// in the header, so a configuration entry written before learners existed still
+// decodes: those payloads simply end where the learner count would begin. A new
+// header field would have changed the meaning of every byte after it.
 func EncodeConfiguration(c Configuration) []byte {
-	v, o := normalize(c.Voters), normalize(c.Outgoing)
-	b := make([]byte, 8+8*len(v)+8*len(o))
+	v, o, l := normalize(c.Voters), normalize(c.Outgoing), normalize(c.Learners)
+	size := 8 + 8*len(v) + 8*len(o)
+	if len(l) > 0 {
+		size += 4 + 8*len(l)
+	}
+	b := make([]byte, size)
 	binary.BigEndian.PutUint32(b[0:4], uint32(len(v)))
 	binary.BigEndian.PutUint32(b[4:8], uint32(len(o)))
 	off := 8
@@ -133,6 +184,14 @@ func EncodeConfiguration(c Configuration) []byte {
 		binary.BigEndian.PutUint64(b[off:off+8], id)
 		off += 8
 	}
+	if len(l) > 0 {
+		binary.BigEndian.PutUint32(b[off:off+4], uint32(len(l)))
+		off += 4
+		for _, id := range l {
+			binary.BigEndian.PutUint64(b[off:off+8], id)
+			off += 8
+		}
+	}
 	return b
 }
 
@@ -143,7 +202,7 @@ func DecodeConfiguration(b []byte) (Configuration, error) {
 	}
 	nv := int(binary.BigEndian.Uint32(b[0:4]))
 	no := int(binary.BigEndian.Uint32(b[4:8]))
-	if len(b) != 8+8*(nv+no) {
+	if len(b) < 8+8*(nv+no) {
 		return Configuration{}, fmt.Errorf("raft: conf change payload length %d does not match %d+%d ids", len(b), nv, no)
 	}
 	c := Configuration{}
@@ -154,6 +213,22 @@ func DecodeConfiguration(b []byte) (Configuration, error) {
 	}
 	for i := 0; i < no; i++ {
 		c.Outgoing = append(c.Outgoing, binary.BigEndian.Uint64(b[off:off+8]))
+		off += 8
+	}
+	// A payload written before learners existed ends here.
+	if off == len(b) {
+		return c, nil
+	}
+	if off+4 > len(b) {
+		return Configuration{}, fmt.Errorf("raft: conf change payload has %d trailing bytes, too few for a learner count", len(b)-off)
+	}
+	nl := int(binary.BigEndian.Uint32(b[off : off+4]))
+	off += 4
+	if len(b) != off+8*nl {
+		return Configuration{}, fmt.Errorf("raft: conf change payload length %d does not match %d learner ids", len(b), nl)
+	}
+	for i := 0; i < nl; i++ {
+		c.Learners = append(c.Learners, binary.BigEndian.Uint64(b[off:off+8]))
 		off += 8
 	}
 	return c, nil

@@ -128,6 +128,11 @@ type confReq struct {
 	resp   chan confResult
 }
 
+type learnerReq struct {
+	ids  []uint64
+	resp chan confResult
+}
+
 // Server is one running quorum node: a raft.Node plus everything around it.
 type Server struct {
 	cfg    Config
@@ -142,6 +147,7 @@ type Server struct {
 	proposeCh chan proposeReq
 	getCh     chan getReq
 	confCh    chan confReq
+	learnerCh chan learnerReq
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 
@@ -170,6 +176,10 @@ type Status struct {
 	// which this node no longer holds log entries. Zero until it compacts.
 	SnapshotIndex uint64
 	Applied       uint64
+	// Progress is how far each node's log has been replicated, as this node
+	// believes. Only meaningful on a leader, and it is what a caller polls to
+	// decide whether a learner has caught up enough to promote.
+	Progress map[uint64]uint64
 	// Config is the membership this node currently believes in, derived from
 	// its own log — a node the leader has not caught up yet may still report
 	// the previous one. Config.IsJoint() is true while a membership change is
@@ -192,8 +202,20 @@ func (s *Server) publishStatus() {
 		ID: s.cfg.ID, Role: s.node.Role(), Term: s.node.Term(),
 		Leader: s.node.Lead(), LastIndex: s.node.LastIndex(), Committed: s.node.Committed(),
 		SnapshotIndex: s.node.SnapshotIndex(), Applied: s.lastApplied,
-		Config: s.node.Config(),
+		Config: s.node.Config(), Progress: s.progress(),
 	})
+}
+
+// progress copies the leader's replication view. Copied rather than shared
+// because Status is read from other goroutines and the map underneath belongs
+// to the loop.
+func (s *Server) progress() map[uint64]uint64 {
+	cfg := s.node.Config()
+	out := make(map[uint64]uint64, len(cfg.Replicas()))
+	for _, id := range cfg.Replicas() {
+		out[id] = s.node.Progress(id)
+	}
+	return out
 }
 
 // New opens (or creates) this node's durable log, recovers its prior state if
@@ -245,6 +267,7 @@ func New(cfg Config) (*Server, error) {
 		proposeCh:   make(chan proposeReq),
 		getCh:       make(chan getReq),
 		confCh:      make(chan confReq),
+		learnerCh:   make(chan learnerReq),
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
 	}
@@ -382,6 +405,68 @@ func (s *Server) ChangeMembership(voters []uint64) (index uint64, leaderHint uin
 	return r.index, 0, nil
 }
 
+// AddLearner adds nodes that replicate but count toward no quorum and cast no
+// vote. It blocks until the entry commits. Like ChangeMembership it must be
+// called on the leader, and the nodes must already be in this node's Addrs.
+func (s *Server) AddLearner(ids ...uint64) (index uint64, leaderHint uint64, err error) {
+	resp := make(chan confResult, 1)
+	select {
+	case s.learnerCh <- learnerReq{ids: ids, resp: resp}:
+	case <-s.stopCh:
+		return 0, 0, errors.New("server: stopped")
+	}
+	r := <-resp
+	if r.err != nil {
+		return 0, r.leader, r.err
+	}
+	if !r.done {
+		return 0, r.leader, errors.New("server: learner change was not committed (this node lost leadership, or the server stopped, before it did)")
+	}
+	return r.index, 0, nil
+}
+
+// AddNode grows the cluster by one without the availability dip a bare
+// ChangeMembership causes.
+//
+// Adding a voter with an empty log makes the cluster's fault tolerance drop
+// rather than rise: the new configuration needs a larger majority and one of
+// its members cannot help until it has caught up, so for that window the
+// cluster tolerates zero failures instead of one (docs/DECISIONS.md §8). This
+// adds the node as a learner first, waits for it to replicate, and only then
+// proposes the voter-set change, so the promotion happens when it can already
+// contribute.
+//
+// tolerance is how many entries behind the leader the node may still be at the
+// moment of promotion. Zero is usually wrong on a cluster taking writes: the
+// target keeps moving, so an exact match may never be observed.
+func (s *Server) AddNode(id uint64, tolerance uint64, timeout time.Duration) error {
+	if _, _, err := s.AddLearner(id); err != nil {
+		return fmt.Errorf("server: add %d as a learner: %w", id, err)
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		st := s.Status()
+		if st.Role != raft.Leader {
+			return fmt.Errorf("server: lost leadership while %d was catching up", id)
+		}
+		if st.LastIndex <= st.Progress[id]+tolerance {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("server: %d was still %d entries behind after %v; it remains a learner",
+				id, st.LastIndex-st.Progress[id], timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	voters := append(append([]uint64(nil), s.Status().Config.Voters...), id)
+	if _, _, err := s.ChangeMembership(voters); err != nil {
+		return fmt.Errorf("server: promote %d to voter: %w", id, err)
+	}
+	return nil
+}
+
 // --- the event loop: the only goroutine that touches s.node -----------------
 
 // logSnapshot is a cheap-enough-to-copy view of everything about the node's
@@ -491,6 +576,22 @@ func (s *Server) loop() {
 					resp <- proposeResult{applied: true}
 				}}
 			}
+
+		case req := <-s.learnerCh:
+			// A learner entry is an ordinary log entry and resolves through the
+			// same pending map as a membership change; it just does not need
+			// joint consensus to get there. See raft.Node.AddLearner.
+			before := s.snapshot()
+			term := s.node.Term()
+			idx, err := s.node.AddLearner(req.ids...)
+			s.afterStep(before)
+			if err != nil {
+				req.resp <- confResult{leader: s.node.Lead(), err: err}
+				continue
+			}
+			pending[idx] = pendingEntry{term: term, resolve: func(applied bool) {
+				req.resp <- confResult{index: idx, done: applied}
+			}}
 
 		case req := <-s.confCh:
 			// A membership change is a log entry like any other, so it

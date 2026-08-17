@@ -239,8 +239,9 @@ func (n *Node) recomputeConfig() {
 	}
 	n.config = cfg
 	// Any node that just entered the configuration needs replication state,
-	// or a leader would not know where to start sending to it.
-	for _, id := range n.config.All() {
+	// or a leader would not know where to start sending to it. Learners
+	// included: replicating to them is the entire point of the state.
+	for _, id := range n.config.Replicas() {
 		if _, ok := n.next[id]; !ok {
 			n.next[id] = n.log.lastIndex() + 1
 			n.match[id] = 0
@@ -344,7 +345,7 @@ func (n *Node) becomeLeader() {
 	n.lead = n.id
 	n.next = map[uint64]uint64{}
 	n.match = map[uint64]uint64{}
-	for _, id := range n.config.All() {
+	for _, id := range n.config.Replicas() {
 		n.next[id] = n.log.lastIndex() + 1
 		n.match[id] = 0
 	}
@@ -503,7 +504,14 @@ func (n *Node) ProposeConfChange(voters []uint64) (index uint64, err error) {
 	if n.log.term(n.log.committed) != n.term {
 		return 0, ErrLeaderNotReady
 	}
-	joint := Configuration{Voters: target, Outgoing: normalize(n.config.Voters)}
+	// Learners carry through the change, minus any that this change promotes to
+	// voter. Dropping them here would silently demote a node mid-catch-up back
+	// to a stranger the leader stops replicating to.
+	joint := Configuration{
+		Voters:   target,
+		Outgoing: normalize(n.config.Voters),
+		Learners: without(n.config.Learners, target),
+	}
 	index = n.log.lastIndex() + 1
 	n.appendOwn(Entry{
 		Term: n.term, Index: index,
@@ -528,8 +536,11 @@ func (n *Node) maybeLeaveJoint() {
 	if n.lastConfigIndex() > n.log.committed {
 		return // the joint entry itself has not committed yet
 	}
-	final := Configuration{Voters: normalize(n.config.Voters)}
-	departing := n.config.All() // captured before the append changes n.config
+	final := Configuration{
+		Voters:   normalize(n.config.Voters),
+		Learners: without(n.config.Learners, n.config.Voters),
+	}
+	departing := n.config.Replicas() // captured before the append changes n.config
 	n.appendOwn(Entry{
 		Term: n.term, Index: n.log.lastIndex() + 1,
 		Type: EntryConfChange, Data: EncodeConfiguration(final),
@@ -603,7 +614,10 @@ func (n *Node) maybeCommit() {
 }
 
 func (n *Node) broadcastAppend() {
-	for _, id := range n.config.All() {
+	// Replicas, not All: a learner is caught up by exactly the same
+	// AppendEntries stream as a voter. What differs is that its acknowledgement
+	// is never counted, which is maybeCommit's job, not this one's.
+	for _, id := range n.config.Replicas() {
 		if id == n.id {
 			continue
 		}
