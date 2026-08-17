@@ -167,6 +167,23 @@ func (n *Node) Committed() uint64 { return n.log.committed }
 func (n *Node) VotedFor() uint64  { return n.vote }
 func (n *Node) Entries() []Entry  { return n.log.entries }
 
+// CommittedEntries returns the committed entries with index in (after,
+// committed]. Callers apply entries by index rather than by slice position,
+// which stopped being the same thing once the log could be compacted.
+func (n *Node) CommittedEntries(after uint64) []Entry {
+	if after < n.log.offset() {
+		after = n.log.offset()
+	}
+	if after >= n.log.committed {
+		return nil
+	}
+	out := make([]Entry, 0, n.log.committed-after)
+	for i := after + 1; i <= n.log.committed; i++ {
+		out = append(out, n.log.at(i))
+	}
+	return out
+}
+
 // ReadMessages removes and returns every outbound message accumulated since the
 // last call. The caller is responsible for delivering them.
 func (n *Node) ReadMessages() []Message {

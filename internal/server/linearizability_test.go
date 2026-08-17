@@ -99,9 +99,9 @@ func tryGet(rec *checker.Recorder, s *Server, clientID int, key string, timeout 
 // This is the M6 proof from docs/DESIGN.md §6, layer 3: not "I believe it's
 // linearizable" but a checker that actually searched a randomized,
 // fault-injected run for a violation.
-func runSchedule(t *testing.T, seed int64, basePort int) []checker.Op {
+func runSchedule(t *testing.T, seed int64, basePort int, snapshotThreshold ...uint64) []checker.Op {
 	t.Helper()
-	servers := cluster(t, 3, basePort)
+	servers := cluster(t, 3, basePort, snapshotThreshold...)
 	ids := byID(servers)
 	if awaitLeader(t, servers, 5*time.Second) == nil {
 		return nil
