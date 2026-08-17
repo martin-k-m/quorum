@@ -9,8 +9,8 @@ bench/run.sh              # Linux/macOS, or Git Bash on Windows
 ```
 
 Raw output is written to `bench/results/` (gitignored): `throughput.txt`,
-`election.txt`, `partition-heal.txt`, `write-cpu.prof`, `write-cpu-top.txt`,
-and `env.txt`.
+`election.txt`, `partition-heal.txt`, `compaction.txt`, `write-cpu.prof`,
+`write-cpu-top.txt`, and `env.txt`.
 
 ## What lives where
 
@@ -24,6 +24,7 @@ invocations.
 |---|---|
 | `internal/server/bench_test.go` | Write and linearizable-read throughput and latency, 3 and 5 nodes, at 1/4/16/64 concurrent clients. Standard Go benchmarks; they only run under `-bench`. |
 | `internal/server/measure_test.go` | Leader election time after killing the leader (a distribution over N trials) and throughput across a partition and heal. Gated behind `-quorum.measure`. |
+| `internal/server/measure_compaction_test.go` | What log compaction costs and buys: bytes on disk and restart time, with it off and with it on. Gated behind `-quorum.measure`. Run three times rather than with `-count 3`, because each run needs a fresh data directory to measure what was left on disk. |
 
 Neither runs during a plain `go test ./...`.
 
