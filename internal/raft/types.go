@@ -98,6 +98,11 @@ const (
 	MsgApp
 	// MsgAppResp answers a MsgApp.
 	MsgAppResp
+	// MsgSnap is a leader's InstallSnapshot RPC, sent instead of a MsgApp when
+	// the entries a follower needs have already been compacted away. It is
+	// answered with a MsgAppResp, because what it establishes is the same thing
+	// a MsgApp establishes: a match index the leader can replicate onward from.
+	MsgSnap
 )
 
 func (t MsgType) String() string {
@@ -114,6 +119,8 @@ func (t MsgType) String() string {
 		return "App"
 	case MsgAppResp:
 		return "AppResp"
+	case MsgSnap:
+		return "Snap"
 	default:
 		return "Unknown"
 	}
@@ -142,4 +149,22 @@ type Message struct {
 	// can advance matchIndex. On reject, a hint at the follower's last index so
 	// the leader can back up nextIndex quickly instead of one step at a time.
 	Match uint64
+
+	Snap *Snapshot // MsgSnap only
+}
+
+// Snapshot is a state machine's contents as of Index, plus everything a
+// receiving node needs to resume replication from that point without the log
+// prefix the snapshot replaces.
+//
+// Config travels with it because a node's configuration is derived by scanning
+// the log backwards for the latest membership entry, and a compacted log cannot
+// be scanned back past the snapshot. Without it a node that installed a snapshot
+// would fall back to the bootstrap configuration and could count the wrong set
+// of voters toward a quorum.
+type Snapshot struct {
+	Index  uint64
+	Term   uint64
+	Config Configuration
+	Data   []byte // the opaque state machine contents; raft never interprets it
 }

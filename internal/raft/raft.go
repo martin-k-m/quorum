@@ -35,12 +35,21 @@ type Node struct {
 	// a truncated log (a follower's conflicting tail being overwritten) and a
 	// restart automatically restore the right configuration too.
 	config Configuration
-	// base is the bootstrap configuration the node was started with, in force
-	// until the log's first EntryConfChange. There is no log compaction yet
-	// (docs/DESIGN.md §9), so the log always reaches back to index 1 and base
-	// is only ever the configuration the cluster was created with.
+	// base is the configuration in force below the log's first membership
+	// entry: the bootstrap configuration until something is compacted, and
+	// thereafter the configuration the snapshot recorded. Compaction is what
+	// makes this more than a constant, because a compacted log cannot be
+	// scanned back to index 1 to re-derive it.
 	base Configuration
 	log  *raftLog
+
+	// snap is the newest snapshot this node holds, either one it built in
+	// Compact or one a leader installed. A leader replicates it to followers
+	// that have fallen behind the compaction point.
+	snap *Snapshot
+	// pending is a snapshot accepted from a leader that the caller has not yet
+	// restored into its state machine. Drained by PendingSnapshot.
+	pending *Snapshot
 
 	role Role
 	term uint64
@@ -131,8 +140,16 @@ func New(c Config) *Node {
 func (n *Node) Restore(term, vote uint64, entries []Entry) {
 	n.term = term
 	n.vote = vote
-	n.log = newLog()
-	n.log.entries = append(n.log.entries, entries...)
+	// Keep whatever sentinel is in place: RestoreSnapshot may have run first and
+	// set it to the snapshot's last covered entry, and resetting to {0,0} here
+	// would claim the node holds a prefix it discarded. Entries at or below it
+	// are already in the snapshot.
+	n.log.entries = n.log.entries[:1]
+	for _, e := range entries {
+		if e.Index > n.log.offset() {
+			n.log.entries = append(n.log.entries, e)
+		}
+	}
 	// The configuration is a function of the log, so replaying restores it,
 	// including a change appended but not committed before the crash — the
 	// pre-crash node was already using it, so the recovered node must agree.
@@ -278,6 +295,8 @@ func (n *Node) Step(m Message) {
 		n.stepVoteResp(m)
 	case MsgAppResp:
 		n.stepAppendResp(m)
+	case MsgSnap:
+		n.stepSnap(m)
 	}
 }
 
@@ -577,6 +596,12 @@ func (n *Node) broadcastAppend() {
 
 func (n *Node) sendAppend(to uint64) {
 	prev := n.next[to] - 1
+	// The entries this follower needs start below the compaction point, so they
+	// no longer exist to send. A snapshot is the only way it can catch up.
+	if prev < n.log.offset() && n.snap != nil {
+		n.send(Message{Type: MsgSnap, To: to, Term: n.term, Snap: n.snap})
+		return
+	}
 	n.send(Message{
 		Type:     MsgApp,
 		To:       to,
