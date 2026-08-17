@@ -92,9 +92,14 @@ the two configurations, so there is no number to report there.
 
 What compaction had to not break is linearizability, since it discards committed
 entries and reinstalls them on a node that missed them, and both are ways to
-lose a write that a shorter log would not reveal. The 25 fault-injected chaos
-schedules were re-run with a threshold of 8, so every schedule crosses it several
-times: 3,000 operations, 0 violations.
+lose a write that a shorter log would not reveal. The chaos harness was re-run
+with a threshold of 8, so every schedule crosses it several times: 10 schedules,
+950 operations, 0 violations.
+
+Ten rather than the twenty-five the un-compacted suite runs. Each schedule is a
+fresh three-node cluster under a partition, and doubling the package's chaos
+workload made the pre-existing timing-sensitive tests fail on a shared CI runner
+under `-race`. The count was load, not coverage.
 
 Still not done: a follower installing a large snapshot receives it in one
 message and one `Restore`, which blocks that node's event loop for as long as
