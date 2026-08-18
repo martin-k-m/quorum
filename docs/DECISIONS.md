@@ -30,27 +30,80 @@ not yet proven correct would have multiplied the surface area of the thing I
 was actually trying to demonstrate. The cost is a hard throughput ceiling and
 the fact that one slow key can block every other key.
 
-## 2. No log compaction or snapshotting, and the log grows without bound
+## 2. Log compaction, off by default, with the threshold in the caller's hands
 
-This is the largest known gap in the system. `internal/storage` appends
-forever. Nothing ever truncates a prefix, there is no snapshot of the state
-machine, and a node that has been running long enough will fill its disk. A
-node restarting replays its entire log from the beginning, so restart time
-grows linearly with total writes ever performed.
+This used to be the largest known gap: the log grew without bound and restart
+time grew linearly with every write ever performed. It is now built. The
+decisions worth recording are the ones inside it, because the shape of a
+snapshot is not obvious and three of these could have gone the other way.
 
-The alternative was to build it: periodically serialize the `fsm` to a snapshot
-file, record the log index it covers, discard the log prefix below that index,
-and add an `InstallSnapshot` RPC for followers too far behind to catch up from
-the log. This is well-understood and Raft's paper specifies it.
+**The offset lives in the log's sentinel, not in a separate field.** `raftLog`
+already kept a dummy entry at slice position 0 so a real entry's index equalled
+its slice position. Compaction turns that dummy into the last entry the snapshot
+covers, so the invariant becomes `index = slot + offset` and every lookup goes
+through two helpers. The alternative, a `snapshotIndex` field beside the slice,
+means every existing index computation is a place someone can forget to subtract.
+Making the sentinel carry it means the arithmetic cannot be skipped, only done.
 
-It lost on sequencing, not merit. Compaction only matters once the thing being
-compacted is known correct, and the milestone that made correctness
-demonstrable — the linearizability checker in M6 — was worth more to me than
-the milestone that made the log finite. `InstallSnapshot` also interacts with
-membership changes in ways that would have been easier to get wrong before M7
-existed than after. The cost is real and I am not going to dress it up: this is
-not a system you could leave running. `internal/storage`'s record format was
-shaped to leave the compaction seam open, which is the only mitigation.
+**The configuration travels inside the snapshot.** A node derives its membership
+by scanning its log backwards for the latest configuration entry, which is what
+makes a truncated tail un-apply for free (§7). A compacted log cannot be scanned
+back that far. So `Compact` resets the node's `base` configuration to the one in
+force at the snapshot index, and `Snapshot` carries it to any follower that
+installs it. Without this a compacted node silently falls back to the bootstrap
+membership and counts the wrong set of voters toward a quorum — which is not a
+crash, it is a node that disagrees about who is allowed to elect a leader.
+
+**Snapshot at the applied index, not the commit index.** They are usually equal
+by the time compaction runs. But a snapshot claims to hold the state machine's
+contents as of its index, and applying is what puts them there; snapshotting at
+a commit index the state machine has not reached ships state that does not exist
+yet. The commit index is the tempting one because it is the larger number.
+
+**`maybeAppend` accepts a `prevIndex` below the snapshot without checking a
+term.** There is no term left to check against, so this looks like a hole. It is
+not: a snapshot is built only from committed entries, so every index it covers
+is already agreed cluster-wide and there is nothing left to disagree about. The
+follower answers with its own last index rather than the tail of the leader's
+message, which keeps the leader's match index monotone when it was sending from
+behind the snapshot.
+
+**The snapshot is a separate file, and the log is rewritten rather than
+appended to.** Recording "everything below N is void" as one more append-only
+record would have been a three-line change and would have reclaimed nothing —
+every byte compaction exists to free would still be on disk. So `Compact` writes
+a new log holding only the entries above the snapshot and renames it into place.
+The snapshot must be fsynced *before* that rename: reversed, a crash between the
+two loses every entry the snapshot was meant to replace.
+
+**Off by default.** `Config.SnapshotThreshold` is zero unless set, which
+disables compaction entirely. Every test that wants to inspect a whole log still
+can, and a caller who has not thought about their working-set size gets the old
+behaviour rather than a surprise. The right threshold depends on how much state
+the machine holds versus how fast it is written, and this package has no way to
+guess that.
+
+Measured on one node, 20,000 writes of 256 bytes over 200 distinct keys, median
+of three runs (see [BENCHMARKS.md](BENCHMARKS.md#log-compaction)): 5,889,055
+bytes of log becomes 53,862 bytes of log plus snapshot, and the log-replay half
+of a restart drops from 97 ms to 10 ms. Write throughput showed no measurable
+difference; run-to-run variance on this machine was larger than any gap between
+the two configurations, so there is no number to report there.
+
+What compaction had to not break is linearizability, since it discards committed
+entries and reinstalls them on a node that missed them, and both are ways to
+lose a write that a shorter log would not reveal. The chaos harness was re-run
+with a threshold of 8, so every schedule crosses it several times: 10 schedules,
+950 operations, 0 violations.
+
+Ten rather than the twenty-five the un-compacted suite runs. Each schedule is a
+fresh three-node cluster under a partition, and doubling the package's chaos
+workload made the pre-existing timing-sensitive tests fail on a shared CI runner
+under `-race`. The count was load, not coverage.
+
+Still not done: a follower installing a large snapshot receives it in one
+message and one `Restore`, which blocks that node's event loop for as long as
+that takes. Chunking it is the standard answer and is not built.
 
 ## 3. Linearizable reads via a log barrier, not a leader lease
 

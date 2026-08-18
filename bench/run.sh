@@ -47,6 +47,20 @@ go test ./internal/server/ \
   | tee "$OUT/partition-heal.txt"
 
 echo
+echo "=== log compaction: disk and restart, with and without (3 runs) ==="
+# Three separate invocations rather than -count=3, so each run gets a fresh
+# temp directory; the whole point is measuring what a node left on disk.
+: > "$OUT/compaction.txt"
+for i in 1 2 3; do
+  echo "=== run $i ===" >> "$OUT/compaction.txt"
+  go test ./internal/server/ \
+    -run 'TestMeasureCompaction' \
+    -quorum.measure \
+    -v -timeout 60m \
+    | tee -a "$OUT/compaction.txt"
+done
+
+echo
 echo "=== CPU profile of the write path (3 nodes, 16 concurrent writers) ==="
 go test ./internal/server/ \
   -run '^$' \

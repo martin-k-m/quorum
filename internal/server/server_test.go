@@ -12,8 +12,12 @@ import (
 // cluster starts n real Server instances, each listening on its own
 // 127.0.0.1 port, wired together into one raft cluster — the M4 end-to-end
 // demo (docs/DESIGN.md §8) exercised as a test instead of by hand.
-func cluster(t *testing.T, n int, basePort int) []*Server {
+func cluster(t *testing.T, n int, basePort int, snapshotThreshold ...uint64) []*Server {
 	t.Helper()
+	var threshold uint64
+	if len(snapshotThreshold) > 0 {
+		threshold = snapshotThreshold[0]
+	}
 	ids := make([]uint64, n)
 	addrs := map[uint64]string{}
 	for i := 0; i < n; i++ {
@@ -26,6 +30,7 @@ func cluster(t *testing.T, n int, basePort int) []*Server {
 		srv, err := New(Config{
 			ID: id, Peers: ids, Addrs: addrs, DataDir: t.TempDir(),
 			ElectionTick: 10, HeartbeatTick: 2, TickInterval: 10 * time.Millisecond,
+			SnapshotThreshold: threshold,
 		})
 		if err != nil {
 			t.Fatalf("New(id=%d): %v", id, err)
