@@ -134,27 +134,61 @@ project. It would be the wrong trade for a read-heavy production store.
 read, no stale read option. `BENCHMARKS.md` reports one read path because one
 is all there is.
 
-## 4. No batching and no pipelining of proposals
+## 4. Batching of proposals, but still no pipelining
 
-The server's event loop takes one client proposal per iteration and calls
-`AppendEntries`, which fsyncs, once per proposal. There is no accumulation of
-several pending proposals into a single log write and a single fsync, and no
-pipelining of `AppendEntries` RPCs to a follower ahead of the previous one's
-acknowledgement.
+The un-batched version of this section was the single most visible performance
+finding in the project: throughput was *flat* from 1 concurrent client to 64
+while latency grew almost linearly with concurrency, which is the signature of a
+serialized resource. The resource was `fsync`, at 81.9% of write-path CPU
+samples, once per proposal.
 
-This shows up directly in the measurements and is the single most visible
-performance finding in the project: throughput is *flat* from 1 concurrent
-client to 64, at roughly 600 writes/s on a 3-node cluster, while latency grows
-almost exactly linearly with concurrency. That is the signature of a serialized
-resource. Sixty-four concurrent clients do not get sixty-four times the
-throughput; they get sixty-four times the queueing delay.
+Batching is now built and is on by default. The event loop drains whatever is
+already queued on the proposal channel, appends it as one batch, and commits it
+with one log write and one `fsync`. `Storage.AppendEntries` was already variadic
+and already synced once per call, so the change is in the loop, not the
+durability layer.
 
-The alternative — drain the proposal channel each loop iteration and commit the
-batch as one fsync — is not a large change and would likely be worth an order
-of magnitude. It lost on the same sequencing argument as compaction: batching
-changes the shape of the code the checker is validating, and I wanted the
-correctness evidence before the optimization. Recording the un-batched number
-is more useful to me than a faster number with no baseline to compare against.
+**It never waits to fill a batch.** The drain is a `select` with a `default`,
+so it takes what has arrived and commits it. Waiting for a fuller batch would
+buy throughput at the cost of adding latency to a lightly loaded cluster, and
+the measurements below show why that trade is unnecessary: batching already
+improves latency at every concurrency level, because the queue it was competing
+with is the thing it drains.
+
+**The cap is 64, and it is a cap rather than a target.** An unbounded drain lets
+one burst build an arbitrarily large write, which converts a throughput win into
+a latency spike for everyone caught in it. `Config.MaxBatchSize` overrides it,
+and 1 disables batching, which is how the baseline column below is reproduced.
+
+Measured, 3-node cluster, median of three runs of 2,000 writes, both arms from
+the same harness in the same session (see
+[BENCHMARKS.md](BENCHMARKS.md#batching)):
+
+| Clients | Un-batched | Batched | |
+|---:|---:|---:|---|
+| 1 | 694 writes/s | 728 writes/s | 1.05x |
+| 4 | 866 writes/s | 1,006 writes/s | 1.16x |
+| 16 | 861 writes/s | 2,892 writes/s | 3.4x |
+| 64 | 849 writes/s | 7,623 writes/s | 9.0x |
+
+Throughput now scales with offered concurrency instead of being flat, and p50
+latency at 64 clients falls from 73.0 ms to 6.9 ms. Both moving in the same
+direction is the expected shape, not a surprise: the old latency was queueing
+behind a serialized `fsync`, so removing the serialization removes the queue.
+
+At 1 client there is nothing to batch and the numbers are unchanged, which is
+the result that says the drain is not doing anything clever behind the scenes.
+
+The three linearizability suites all run with batching on by default now:
+3,000 operations fault-injected, 1,200 with compaction also on, 2,400 across
+membership changes, 0 violations in any of them.
+
+**Pipelining is still not built.** `AppendEntries` to a follower is not sent
+ahead of the previous one's acknowledgement, so a leader still waits a round
+trip per follower before the next batch goes out. That is the remaining
+serialization on the replication path, and it is a different mechanism from
+this one: batching makes each round trip carry more, pipelining would overlap
+the round trips. The measurements above are with pipelining absent.
 
 ## 5. `strata` is not the storage backend
 

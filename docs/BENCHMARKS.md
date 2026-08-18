@@ -5,13 +5,21 @@ the machine described below. The invocations are recorded so they can be
 re-run; nothing here is estimated, extrapolated, or carried over from another
 machine.
 
-The short version: **`quorum` commits roughly 500-600 writes per second on a
-3-node cluster and that number does not improve with client concurrency.**
-Latency grows almost exactly linearly with concurrency while throughput stays
-flat, which is the signature of a serialized resource. A CPU profile identifies
-it precisely: 82% of all samples are inside a single `fsync`. There is one
-fsync per log entry and no batching, so the write path is disk-sync-bound and
-concurrency only adds queueing delay.
+The short version: **the write path is disk-sync-bound**, and a CPU profile says
+so precisely: 82% of all samples are inside a single `fsync`.
+
+That used to mean throughput was flat at roughly 500-600 writes/s on a 3-node
+cluster no matter how many clients offered work, while latency grew almost
+linearly with concurrency, which is the signature of a serialized resource.
+Proposals are now batched into one log write and one `fsync`, and throughput
+scales with concurrency instead: **728 writes/s at 1 client, 7,623 at 64**, with
+p50 latency falling rather than rising. See [Batching](#batching).
+
+The per-configuration tables in the next two sections predate batching and are
+the un-batched baseline. They are kept because the batching comparison is read
+against them, and because the profile that explains the whole page was taken on
+that path. The batching section states both arms explicitly and both were
+measured in one session; do not compare a number there against a number here.
 
 ---
 
@@ -128,12 +136,15 @@ fsynced by every node that accepts it, committed on a majority, and applied.
 | 16 | 474 writes/s | 30.50 ms | 77.79 ms | 101.4 ms |
 | 64 | 441 writes/s | 140.00 ms | 271.80 ms | 291.2 ms |
 
-**Throughput is flat.** Going from 1 to 64 concurrent clients — 64× the offered
-load — moves 3-node throughput from 506/s to 612/s, about 1.2×. Over the same
-range p50 latency goes from 1.58 ms to 96.21 ms, about 61×. Sixty-four clients
-do not get more work done; they get in line. Latency × throughput is
-approximately constant, which is Little's Law describing a queue in front of a
-single server.
+**Throughput is flat here, un-batched.** Going from 1 to 64 concurrent clients
+— 64× the offered load — moves 3-node throughput from 506/s to 612/s, about
+1.2×. Over the same range p50 latency goes from 1.58 ms to 96.21 ms, about 61×.
+Sixty-four clients do not get more work done; they get in line. Latency ×
+throughput is approximately constant, which is Little's Law describing a queue
+in front of a single server.
+
+This is the finding batching was built to address, and [Batching](#batching)
+measures what it moved. The tables above are the baseline it is read against.
 
 Five nodes cost roughly 30% of the three-node throughput. Part of that is the
 larger quorum and the two extra sets of `AppendEntries` RPCs; part is the
@@ -243,21 +254,58 @@ than a single post-heal average would need a longer run and is not done here.
 The important correctness observation is that the minority side committed
 nothing throughout, which the harness asserts.
 
-## Batching and pipelining
+## Batching
 
-**`quorum` implements neither.** This is a plain statement of what the code
-does, not a caveat:
+The event loop drains whatever proposals have already queued and commits them
+with one log write and one `fsync`. On by default, capped at 64.
 
-- **No batching.** The server's event loop handles one client proposal per
-  iteration of its `select`, and each one calls `Storage.AppendEntries`, which
-  issues its own `fsync`. Several proposals arriving together are not coalesced
-  into one log write and one sync.
-- **No pipelining.** `AppendEntries` to a follower is not sent ahead of the
-  previous one's acknowledgement.
+**Pipelining is still not implemented.** `AppendEntries` to a follower is not
+sent ahead of the previous one's acknowledgement, so everything below is
+measured with the replication round trips still serialized.
 
-There is consequently no "optimization on vs off" comparison to present. The
-tables above *are* the off case, and there is no on case to compare them
-against. Reasoning in [DECISIONS.md](DECISIONS.md) §4.
+Both arms come from the same harness in the same session on the machine
+described above, 3 nodes, `-benchtime 2000x -count 3`, median of the three.
+`-quorum.batch=1` produces the un-batched column; the default produces the
+other. Comparing against the tables further up this page instead would be
+comparing two different sessions.
+
+### Throughput
+
+| Concurrent clients | Un-batched | Batched | Change |
+|---:|---:|---:|---:|
+| 1 | 694 writes/s | 728 writes/s | 1.05x |
+| 4 | 866 writes/s | 1,006 writes/s | 1.16x |
+| 16 | 861 writes/s | 2,892 writes/s | 3.4x |
+| 64 | 849 writes/s | 7,623 writes/s | 9.0x |
+
+### Latency, as one client experienced it
+
+| Concurrent clients | p50 un-batched | p50 batched | p99 un-batched | p99 batched |
+|---:|---:|---:|---:|---:|
+| 1 | 1.46 ms | 1.31 ms | 3.68 ms | 3.82 ms |
+| 4 | 4.46 ms | 3.84 ms | 11.07 ms | 8.06 ms |
+| 16 | 17.97 ms | 5.17 ms | 27.08 ms | 10.18 ms |
+| 64 | 73.00 ms | 6.86 ms | 121.30 ms | 18.43 ms |
+
+**Throughput now scales with concurrency instead of being flat**, which was the
+finding the un-batched tables above exist to record. Throughput and latency
+improve together, which is the expected shape rather than a surprise: the old
+latency was queueing behind a serialized `fsync`, so draining the queue removes
+both the ceiling and the wait.
+
+**At 1 client nothing changes**, within run-to-run noise. There is nothing to
+batch at that concurrency, and a drain that produced a difference there would
+mean it was doing something other than what it claims.
+
+The 9.0x at 64 clients is a floor for what batching is worth on this path, not a
+ceiling: the remaining serialization is the un-pipelined replication round trip,
+which batching does not touch.
+
+Correctness under batching is checked by the same three linearizability suites,
+which run with it on by default: 3,000 fault-injected operations, 1,200 with
+compaction also on, and 2,400 across membership changes, 0 violations in any.
+
+Reasoning in [DECISIONS.md](DECISIONS.md) §4.
 
 ## Log compaction
 
