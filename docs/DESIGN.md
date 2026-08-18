@@ -260,7 +260,8 @@ networking — which is exactly why the pure-core design in §5 matters.
   interface. Leaning a `tick()` the server calls at a fixed cadence, because it
   keeps the core free of any time type at all.
 - **Snapshotting:** deferred past v1, but the log-compaction seam should be left
-  in the storage interface now so it is not a rewrite later.
+  in the storage interface now so it is not a rewrite later. Built since, and
+  the seam held: see [DECISIONS.md](DECISIONS.md) §2.
 
 ## 10. M7: dynamic membership (and the `strata` backend, dropped)
 
@@ -373,7 +374,8 @@ that says so rather than shipping a half-built bridge as a headline.
 
 The genuinely valuable version of "use a real storage engine here" is log
 compaction and snapshotting (§9), which `internal/storage` was shaped to
-leave room for. That is a `quorum` milestone, not a `strata` integration.
+leave room for. That is a `quorum` milestone, not a `strata` integration, and
+it has since been built as one: see [DECISIONS.md](DECISIONS.md) §2.
 
 ---
 

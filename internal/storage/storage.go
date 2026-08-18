@@ -46,7 +46,8 @@ const (
 // concurrent use; callers (the future server package) are expected to
 // serialize access, same as strata's WAL.
 type Storage struct {
-	f *os.File
+	f    *os.File
+	path string // kept so Compact can rewrite the file and SaveSnapshot can sit beside it
 }
 
 // Open opens (creating if absent) the durable log at path. Call Recover
@@ -57,7 +58,7 @@ func Open(path string) (*Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: open %s: %w", path, err)
 	}
-	return &Storage{f: f}, nil
+	return &Storage{f: f, path: path}, nil
 }
 
 // Recover replays every whole, checksum-valid record in file order, drops a

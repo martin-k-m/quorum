@@ -9,6 +9,7 @@ package fsm
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -102,4 +103,76 @@ func (f *FSM) Get(key []byte) ([]byte, bool) {
 	defer f.mu.RUnlock()
 	v, ok := f.data[string(key)]
 	return v, ok
+}
+
+// Snapshot serializes the whole map. Keys are emitted in sorted order, so two
+// nodes that have applied the same commands produce byte-identical snapshots
+// and a snapshot can be compared or checksummed rather than merely trusted.
+func (f *FSM) Snapshot() []byte {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	keys := make([]string, 0, len(f.data))
+	for k := range f.data {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	size := 4
+	for _, k := range keys {
+		size += 4 + len(k) + 4 + len(f.data[k])
+	}
+	b := make([]byte, size)
+	binary.BigEndian.PutUint32(b[0:4], uint32(len(keys)))
+	off := 4
+	for _, k := range keys {
+		v := f.data[k]
+		binary.BigEndian.PutUint32(b[off:off+4], uint32(len(k)))
+		off += 4
+		copy(b[off:], k)
+		off += len(k)
+		binary.BigEndian.PutUint32(b[off:off+4], uint32(len(v)))
+		off += 4
+		copy(b[off:], v)
+		off += len(v)
+	}
+	return b
+}
+
+// Restore replaces the entire contents with a snapshot's. It replaces rather
+// than merges: a snapshot is the whole state as of its index, and merging would
+// leave behind keys deleted before it was taken.
+func (f *FSM) Restore(b []byte) error {
+	if len(b) < 4 {
+		return fmt.Errorf("fsm: snapshot shorter than its header")
+	}
+	count := binary.BigEndian.Uint32(b[0:4])
+	data := make(map[string][]byte, count)
+	off := 4
+	for i := uint32(0); i < count; i++ {
+		if off+4 > len(b) {
+			return fmt.Errorf("fsm: snapshot truncated in key %d of %d", i, count)
+		}
+		keyLen := int(binary.BigEndian.Uint32(b[off : off+4]))
+		off += 4
+		if off+keyLen+4 > len(b) {
+			return fmt.Errorf("fsm: snapshot truncated in key %d of %d", i, count)
+		}
+		key := string(b[off : off+keyLen])
+		off += keyLen
+		valLen := int(binary.BigEndian.Uint32(b[off : off+4]))
+		off += 4
+		if off+valLen > len(b) {
+			return fmt.Errorf("fsm: snapshot truncated in value %d of %d", i, count)
+		}
+		data[key] = append([]byte(nil), b[off:off+valLen]...)
+		off += valLen
+	}
+	if off != len(b) {
+		return fmt.Errorf("fsm: snapshot has %d trailing bytes after %d keys", len(b)-off, count)
+	}
+	f.mu.Lock()
+	f.data = data
+	f.mu.Unlock()
+	return nil
 }

@@ -119,11 +119,12 @@ replicates without voting until it has caught up, and it is the clearest single
 item of remaining work (`DECISIONS.md` §8). There is also no leadership transfer,
 so a graceful step-down before removal is not available.
 
-**8. No compaction.**
+**8. No compaction.** (The question is about the state before it was built; the
+answer ends with what changed.)
 
 Two consequences: the log grows without bound, so a node running long enough fills
 its disk; and a restarting node replays its entire log from the beginning, so
-restart time grows linearly with total writes ever performed. This is not a system
+restart time grows linearly with total writes ever performed. That is not a system
 you could leave running.
 
 The sequencing argument: compaction only matters once the thing being compacted is
@@ -131,8 +132,16 @@ known correct, and the milestone that made correctness demonstrable, the
 linearizability checker, was worth more than the milestone that made the log
 finite. `InstallSnapshot` also interacts with membership changes in ways that
 would have been easier to get wrong before M7 existed than after. The record
-format in `internal/storage` was shaped to leave the compaction seam open, which
-is the only mitigation.
+format in `internal/storage` was shaped to leave the compaction seam open.
+
+It is built now, and the seam held: `raftLog`'s sentinel became the last entry a
+snapshot covers, so index arithmetic is one subtraction rather than an invariant
+to remember. Measured on one node over 20,000 writes, 5,889,055 bytes of log
+becomes 53,862 bytes of log plus snapshot and the log-replay half of a restart
+drops from 97 ms to 10 ms (`BENCHMARKS.md`). The check that mattered was not that
+the log got shorter but that nothing was lost: the chaos schedules re-run with
+compaction on give 950 operations and 0 violations. Reasoning in
+`DECISIONS.md` §2.
 
 **9. (design) Batching.**
 

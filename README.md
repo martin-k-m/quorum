@@ -136,9 +136,9 @@ done — a runnable cluster with its correctness checked, not just asserted:
 - **[docs/BUGS.md](docs/BUGS.md)** — the five real defects found so far, what
   caught each, and the regression test that pins it.
 - **[docs/DECISIONS.md](docs/DECISIONS.md)** — the choices that had a real
-  alternative, including the known gaps: no log compaction (the log grows
-  without bound), no lease read path, no batching or pipelining, and no
-  learner phase for a node being added.
+  alternative, including how log compaction is shaped and the remaining known
+  gaps: no lease read path, no batching or pipelining, and no learner phase for
+  a node being added.
 
 ### What "linearizable" and "durable" mean here, concretely
 

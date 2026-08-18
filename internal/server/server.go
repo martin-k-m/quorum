@@ -43,6 +43,13 @@ type Config struct {
 	ElectionTick  int
 	HeartbeatTick int
 	TickInterval  time.Duration
+
+	// SnapshotThreshold is how many applied entries may accumulate past the
+	// last snapshot before the node takes a new one and discards the log
+	// prefix. Zero disables compaction, which is what every test that wants to
+	// inspect a whole log wants, and what the node did before compaction
+	// existed. See docs/DECISIONS.md §2.
+	SnapshotThreshold uint64
 }
 
 func (c Config) validate() error {
@@ -144,6 +151,10 @@ type Status struct {
 	Leader    uint64 // raft.None if no leader is currently known
 	LastIndex uint64
 	Committed uint64
+	// SnapshotIndex is the last entry a snapshot covers, and so the point below
+	// which this node no longer holds log entries. Zero until it compacts.
+	SnapshotIndex uint64
+	Applied       uint64
 	// Config is the membership this node currently believes in, derived from
 	// its own log — a node the leader has not caught up yet may still report
 	// the previous one. Config.IsJoint() is true while a membership change is
@@ -165,6 +176,7 @@ func (s *Server) publishStatus() {
 	s.status.Store(Status{
 		ID: s.cfg.ID, Role: s.node.Role(), Term: s.node.Term(),
 		Leader: s.node.Lead(), LastIndex: s.node.LastIndex(), Committed: s.node.Committed(),
+		SnapshotIndex: s.node.SnapshotIndex(), Applied: s.lastApplied,
 		Config: s.node.Config(),
 	})
 }
@@ -179,29 +191,47 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	snap, err := store.LoadSnapshot()
+	if err != nil {
+		return nil, err
+	}
 	term, vote, entries, err := store.Recover()
 	if err != nil {
 		return nil, err
 	}
 
 	node := raft.New(raft.Config{ID: cfg.ID, Peers: cfg.Peers, ElectionTick: cfg.ElectionTick, HeartbeatTick: cfg.HeartbeatTick})
+	machine := fsm.New()
+	var applied uint64
+	// The snapshot goes in before the log replay: it establishes where the log
+	// now starts, and Restore drops any entry at or below it. The state machine
+	// is seeded from the same snapshot, so it and lastApplied agree about what
+	// has already been applied before a single entry is replayed.
+	if snap != nil {
+		if err := machine.Restore(snap.Data); err != nil {
+			return nil, fmt.Errorf("server: restore state machine from snapshot: %w", err)
+		}
+		node.RestoreSnapshot(snap)
+		applied = snap.Index
+	}
 	node.Restore(term, vote, entries)
 
 	sender := transport.NewSender()
 	sender.SetAddrs(cfg.Addrs)
 
 	s := &Server{
-		cfg:       cfg,
-		node:      node,
-		store:     store,
-		fsm:       fsm.New(),
-		sender:    sender,
-		inbox:     make(chan raft.Message, 256),
-		proposeCh: make(chan proposeReq),
-		getCh:     make(chan getReq),
-		confCh:    make(chan confReq),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		cfg:         cfg,
+		node:        node,
+		store:       store,
+		fsm:         machine,
+		lastApplied: applied,
+		sender:      sender,
+		inbox:       make(chan raft.Message, 256),
+		proposeCh:   make(chan proposeReq),
+		getCh:       make(chan getReq),
+		confCh:      make(chan confReq),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
 	}
 	s.publishStatus()
 	return s, nil
@@ -492,6 +522,7 @@ func (s *Server) loop() {
 		}
 
 		s.applyCommitted(pending)
+		s.maybeCompact()
 		s.publishStatus()
 	}
 }
@@ -506,6 +537,15 @@ func (s *Server) afterStep(before logSnapshot) {
 		if err := s.store.SaveState(s.node.Term(), s.node.VotedFor()); err != nil {
 			panic(fmt.Sprintf("server: durable state write failed, cannot safely continue: %v", err))
 		}
+	}
+
+	// A snapshot the leader just installed replaced the log wholesale, and
+	// rewrote the durable one to match. The diff below would otherwise read
+	// that as a divergence and truncate a log that is already correct, so the
+	// baseline is reset to what is now on disk.
+	if snap := s.node.PendingSnapshot(); snap != nil {
+		s.installSnapshot(snap)
+		before.entries = append([]raft.Entry(nil), s.node.Entries()[1:]...)
 	}
 
 	after := s.node.Entries()[1:]
@@ -545,11 +585,8 @@ func (s *Server) afterStep(before logSnapshot) {
 // term check gates every resolution: the index alone is not enough proof
 // that the entry now at it is the one the caller actually appended.
 func (s *Server) applyCommitted(pending map[uint64]pendingEntry) {
-	committed := s.node.Committed()
-	entries := s.node.Entries()
-	for s.lastApplied < committed {
-		s.lastApplied++
-		e := entries[s.lastApplied]
+	for _, e := range s.node.CommittedEntries(s.lastApplied) {
+		s.lastApplied = e.Index
 		// A configuration entry is consensus bookkeeping, not a key-value
 		// command: raft.Node has already acted on it (on append, not here),
 		// and handing its encoded membership to the fsm would be decoded as
@@ -563,6 +600,54 @@ func (s *Server) applyCommitted(pending map[uint64]pendingEntry) {
 			delete(pending, s.lastApplied)
 			pe.resolve(pe.term == e.Term)
 		}
+	}
+}
+
+// installSnapshot adopts a snapshot a leader sent because this node had fallen
+// behind the leader's compaction point. The state machine is replaced wholesale
+// and lastApplied jumps to the snapshot's index: there are no entries to replay
+// between here and there, which is the entire reason the leader sent it.
+func (s *Server) installSnapshot(snap *raft.Snapshot) {
+	if err := s.fsm.Restore(snap.Data); err != nil {
+		panic(fmt.Sprintf("server: restoring a leader's snapshot failed, state machine is now suspect: %v", err))
+	}
+	s.lastApplied = snap.Index
+	if err := s.store.SaveSnapshot(snap); err != nil {
+		panic(fmt.Sprintf("server: durable snapshot write failed, cannot safely continue: %v", err))
+	}
+	if err := s.store.Compact(snap.Index, s.node.Term(), s.node.VotedFor(), s.node.Entries()[1:]); err != nil {
+		panic(fmt.Sprintf("server: durable log compaction failed, cannot safely continue: %v", err))
+	}
+}
+
+// maybeCompact takes a snapshot once enough entries have been applied past the
+// last one, and discards the prefix they replace.
+//
+// It snapshots at lastApplied rather than at the commit index. The two are
+// usually equal by the time this runs, but a snapshot claims to contain the
+// state machine's contents as of its index, and applying is what puts them
+// there. Snapshotting at a commit index the state machine has not reached would
+// ship state that does not exist yet.
+func (s *Server) maybeCompact() {
+	if s.cfg.SnapshotThreshold == 0 {
+		return
+	}
+	if s.lastApplied-s.node.SnapshotIndex() < s.cfg.SnapshotThreshold {
+		return
+	}
+	if err := s.node.Compact(s.lastApplied, s.fsm.Snapshot()); err != nil {
+		// The guards in raft.Node.Compact are all "not yet", never "broken":
+		// nothing to compact, or the index is not committed. Both are fine to
+		// skip and retry on the next pass.
+		return
+	}
+	if err := s.store.SaveSnapshot(s.node.Snapshot()); err != nil {
+		panic(fmt.Sprintf("server: durable snapshot write failed, cannot safely continue: %v", err))
+	}
+	// After the snapshot is durable, and only then. Reversed, a crash between
+	// the two loses every entry the snapshot was meant to replace.
+	if err := s.store.Compact(s.node.SnapshotIndex(), s.node.Term(), s.node.VotedFor(), s.node.Entries()[1:]); err != nil {
+		panic(fmt.Sprintf("server: durable log compaction failed, cannot safely continue: %v", err))
 	}
 }
 
