@@ -347,10 +347,9 @@ heard of it and arrive with an inflated term.
 
 ### 10.3 What M7 deliberately does not do
 
-- **No non-voting catch-up phase.** A node added with an empty log counts
-  toward quorums immediately, so the cluster's fault tolerance dips until it
-  has caught up. This is an availability cost, never a safety one, and the
-  fix (a learner state) is orthogonal.
+- **~~No non-voting catch-up phase.~~** Built since. A node is added as a
+  learner, replicates without counting toward any quorum, and is promoted once
+  it can contribute. See [DECISIONS.md](DECISIONS.md) §8.
 - **No leadership transfer.** Removing the leader works: it steps down and
   the survivors elect a replacement. It costs one election.
 - **No automatic node discovery.** See §10.2.

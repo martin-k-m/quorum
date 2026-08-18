@@ -122,10 +122,16 @@ during the catch-up window the cluster tolerates zero failures instead of one.
 
 It is an **availability** cost and never a safety one. The joint-consensus rules
 hold throughout, so nothing incorrect can commit; the cluster may simply fail to
-commit anything for a while. The fix is a learner phase, where a new node
-replicates without voting until it has caught up, and it is the clearest single
-item of remaining work (`DECISIONS.md` §8). There is also no leadership transfer,
-so a graceful step-down before removal is not available.
+commit anything for a while.
+
+That is what `ChangeMembership` still does, and it is what this question asks
+about. `AddNode` avoids it: the node joins as a learner, replicates without
+counting toward any quorum or casting a vote, and is promoted only once it can
+already contribute. Adding the learner needs no joint consensus, because a
+learner is in neither majority before nor after and the quorum is identical on
+both sides of the entry; the promotion is an ordinary voter-set change and does
+(`DECISIONS.md` §8). There is still no leadership transfer, so a graceful
+step-down before removal is not available.
 
 **8. No compaction.** (The question is about the state before it was built; the
 answer ends with what changed.)
