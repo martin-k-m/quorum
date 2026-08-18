@@ -40,7 +40,7 @@ func TestMeasureCompaction(t *testing.T) {
 		t.Run(fmt.Sprintf("compaction=%s", label), func(t *testing.T) {
 			dir := t.TempDir()
 			ids := []uint64{1}
-			addrs := map[uint64]string{1: "127.0.0.1:19600"}
+			addrs := map[uint64]string{1: "127.0.0.1:19990"}
 
 			srv := startNode(t, 1, ids, addrs, dir, threshold)
 			awaitLeader(t, []*Server{srv}, 10*time.Second)

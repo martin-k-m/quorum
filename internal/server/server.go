@@ -50,7 +50,22 @@ type Config struct {
 	// inspect a whole log wants, and what the node did before compaction
 	// existed. See docs/DECISIONS.md §2.
 	SnapshotThreshold uint64
+
+	// MaxBatchSize caps how many client proposals the event loop folds into one
+	// log write and one fsync. Zero means defaultMaxBatch; 1 disables batching
+	// and is how the un-batched baseline in docs/BENCHMARKS.md is reproduced.
+	//
+	// It is a cap, not a target. The loop never waits to fill it: it takes
+	// whatever has already queued and commits that. Waiting would buy larger
+	// batches at the cost of adding latency to a lightly loaded cluster, which
+	// is the wrong trade for a system whose writes already cost a disk sync.
+	MaxBatchSize int
 }
+
+// defaultMaxBatch bounds a single fsync's worth of proposals. The ceiling
+// exists so one burst cannot build an unboundedly large write, which would
+// convert a throughput win into a latency spike for everyone in it.
+const defaultMaxBatch = 64
 
 func (c Config) validate() error {
 	if c.ID == 0 {
@@ -443,22 +458,39 @@ func (s *Server) loop() {
 			s.afterStep(before)
 
 		case req := <-s.proposeCh:
+			// Everything already queued on the channel goes into the same log
+			// write and the same fsync. Under load this is the whole
+			// optimization: the cost of a write is one disk sync, and one sync
+			// can carry as many entries as have arrived. See docs/DECISIONS.md §4.
+			batch := s.drainProposals(req)
 			if s.node.Role() != raft.Leader {
-				req.resp <- proposeResult{leader: s.node.Lead()}
+				lead := s.node.Lead()
+				for _, r := range batch {
+					r.resp <- proposeResult{leader: lead}
+				}
 				continue
 			}
 			before := s.snapshot()
 			term := s.node.Term()
-			idx := s.node.LastIndex() + 1
-			s.node.Step(raft.Message{Type: raft.MsgProp, Entries: []raft.Entry{{Data: req.data}}})
+			first := s.node.LastIndex() + 1
+			entries := make([]raft.Entry, len(batch))
+			for i, r := range batch {
+				entries[i] = raft.Entry{Data: r.data}
+			}
+			s.node.Step(raft.Message{Type: raft.MsgProp, Entries: entries})
 			s.afterStep(before)
-			pending[idx] = pendingEntry{term: term, resolve: func(applied bool) {
-				if !applied {
-					req.resp <- proposeResult{err: errors.New("server: proposal was not committed (this node lost leadership, or the server stopped, before it did)")}
-					return
-				}
-				req.resp <- proposeResult{applied: true}
-			}}
+			// The entries were appended in order from first, so the i-th
+			// request owns index first+i.
+			for i, r := range batch {
+				resp := r.resp
+				pending[first+uint64(i)] = pendingEntry{term: term, resolve: func(applied bool) {
+					if !applied {
+						resp <- proposeResult{err: errors.New("server: proposal was not committed (this node lost leadership, or the server stopped, before it did)")}
+						return
+					}
+					resp <- proposeResult{applied: true}
+				}}
+			}
 
 		case req := <-s.confCh:
 			// A membership change is a log entry like any other, so it
@@ -525,6 +557,27 @@ func (s *Server) loop() {
 		s.maybeCompact()
 		s.publishStatus()
 	}
+}
+
+// drainProposals returns first plus every proposal already queued on the
+// channel, up to the batch cap. It never blocks: the default case is what makes
+// this "take what is here" rather than "wait for more".
+func (s *Server) drainProposals(first proposeReq) []proposeReq {
+	max := s.cfg.MaxBatchSize
+	if max <= 0 {
+		max = defaultMaxBatch
+	}
+	batch := make([]proposeReq, 1, max)
+	batch[0] = first
+	for len(batch) < max {
+		select {
+		case r := <-s.proposeCh:
+			batch = append(batch, r)
+		default:
+			return batch
+		}
+	}
+	return batch
 }
 
 // afterStep persists whatever the just-completed Step/Tick changed and ships

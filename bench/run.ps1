@@ -27,6 +27,13 @@ go test ./internal/server/ -run 'TestMeasureElectionTime' -quorum.measure -quoru
 Write-Output "=== throughput during and after a partition heal (5 nodes) ==="
 go test ./internal/server/ -run 'TestMeasurePartitionHealThroughput' -quorum.measure -v -timeout 60m | Tee-Object -FilePath "$Out\partition-heal.txt"
 
+Write-Output "=== batching on vs off (3 nodes) ==="
+# Both arms from this same session, so the comparison is not across machines.
+"--- un-batched (MaxBatchSize=1) ---" | Set-Content "$Out\batching.txt"
+go test ./internal/server/ -run '^$' -bench 'BenchmarkWrite/nodes=3' -benchtime 2000x -count 3 -quorum.batch=1 -timeout 60m | Tee-Object -FilePath "$Out\batching.txt" -Append
+"--- batched (default) ---" | Add-Content "$Out\batching.txt"
+go test ./internal/server/ -run '^$' -bench 'BenchmarkWrite/nodes=3' -benchtime 2000x -count 3 -timeout 60m | Tee-Object -FilePath "$Out\batching.txt" -Append
+
 Write-Output "=== log compaction: disk and restart, with and without (3 runs) ==="
 # Three separate invocations rather than -count 3, so each run gets a fresh
 # temp directory; the whole point is measuring what a node left on disk.

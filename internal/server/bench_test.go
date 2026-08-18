@@ -1,6 +1,7 @@
 package server
 
 import (
+	"flag"
 	"fmt"
 	"sort"
 	"sync"
@@ -19,6 +20,12 @@ import (
 // Ports start at 20000 to stay clear of the 191xx-195xx range the correctness
 // tests use, so a benchmark run and a test run cannot collide.
 
+// benchBatchSize sets Config.MaxBatchSize for every cluster a benchmark builds.
+// It exists so the batched and un-batched arms are produced by the same harness
+// on the same machine in the same session; comparing against numbers measured
+// before batching existed would be comparing two machines.
+var benchBatchSize = flag.Int("quorum.batch", 0, "Config.MaxBatchSize for benchmark clusters (1 disables batching, 0 uses the default)")
+
 // benchCluster is cluster() for a *testing.B: n real Servers on loopback,
 // wired through the real net/rpc transport, torn down when the benchmark ends.
 func benchCluster(b *testing.B, n int, basePort int) []*Server {
@@ -34,6 +41,7 @@ func benchCluster(b *testing.B, n int, basePort int) []*Server {
 		srv, err := New(Config{
 			ID: id, Peers: ids, Addrs: addrs, DataDir: b.TempDir(),
 			ElectionTick: 10, HeartbeatTick: 2, TickInterval: 10 * time.Millisecond,
+			MaxBatchSize: *benchBatchSize,
 		})
 		if err != nil {
 			b.Fatalf("New(id=%d): %v", id, err)
