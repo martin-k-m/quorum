@@ -141,7 +141,7 @@ done — a runnable cluster with its correctness checked, not just asserted:
 - **[docs/DECISIONS.md](docs/DECISIONS.md)** — the choices that had a real
   alternative, including how log compaction and proposal batching are shaped and
   the remaining known gaps: no lease read path, no pipelining of replication,
-  and no learner phase for a node being added.
+  and no leadership transfer.
 
 ### What "linearizable" and "durable" mean here, concretely
 
