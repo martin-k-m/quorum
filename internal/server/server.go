@@ -654,9 +654,15 @@ func (s *Server) loop() {
 			}}
 		}
 
-		s.applyCommitted(pending)
+		resolved := s.applyCommitted(pending)
 		s.maybeCompact()
 		s.publishStatus()
+		// Resolved last, so a caller that returns from Propose or Get and then
+		// reads Status sees its own entry rather than the view from before it
+		// committed.
+		for _, resolve := range resolved {
+			resolve()
+		}
 	}
 }
 
@@ -732,13 +738,17 @@ func (s *Server) afterStep(before logSnapshot) {
 }
 
 // applyCommitted advances the state machine up to the node's current commit
-// index and resolves any Propose or read-barrier Get whose entry just landed
+// index and returns, rather than runs, the resolver of any Propose or
+// read-barrier Get whose entry just landed. The caller runs them after
+// publishing Status, so that a caller waking up from Propose or Get cannot
+// read a Status older than the entry it was waiting for
 // — for a Get this is the moment its answer is read from the fsm, since only
 // now is it guaranteed to reflect everything committed as of when the read
 // began (see the getCh case in loop for why). See pendingEntry for why a
 // term check gates every resolution: the index alone is not enough proof
 // that the entry now at it is the one the caller actually appended.
-func (s *Server) applyCommitted(pending map[uint64]pendingEntry) {
+func (s *Server) applyCommitted(pending map[uint64]pendingEntry) []func() {
+	var resolved []func()
 	for _, e := range s.node.CommittedEntries(s.lastApplied) {
 		s.lastApplied = e.Index
 		// A configuration entry is consensus bookkeeping, not a key-value
@@ -752,9 +762,11 @@ func (s *Server) applyCommitted(pending map[uint64]pendingEntry) {
 		}
 		if pe, ok := pending[s.lastApplied]; ok {
 			delete(pending, s.lastApplied)
-			pe.resolve(pe.term == e.Term)
+			applied := pe.term == e.Term
+			resolved = append(resolved, func() { pe.resolve(applied) })
 		}
 	}
+	return resolved
 }
 
 // installSnapshot adopts a snapshot a leader sent because this node had fallen
