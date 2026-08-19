@@ -337,11 +337,20 @@ than sampling it once before healing. The assertion is unchanged in what it
 demands: the old leader must step down and hold the same committed index as
 the new leader. It just compares against a live value instead of a stale one.
 
-**What this says about `Status`.** It is an eventually-published view, and
-after compaction it can lag a proposal's return by however long taking a
-snapshot takes. That is documented behaviour rather than a defect, and nothing
-in the store depends on it being tighter, but any caller that proposes and then
-reads `Status` expecting to see its own write has the same bug this test did.
+**The cause underneath, fixed too.** Repairing the assertion leaves the
+footgun that produced it: any caller that proposes and then reads `Status`
+expecting to see its own write had the same bug this test did, and after
+compaction the gap is as wide as taking a snapshot. `applyCommitted` now
+returns the resolvers rather than running them, and the loop runs them after
+`publishStatus`, so a caller cannot wake to a `Status` older than the entry it
+was waiting for. `TestStatusReflectsAProposalByTheTimeItReturns` proposes 50
+entries and reads `Status` on each return; it fails at iteration 3 without the
+reordering.
+
+The trade-off rejected: publishing `Status` a second time, before resolving,
+would have fixed the same thing while making every iteration pay for two
+snapshots to serve a case that only matters when a proposal lands. Deferring
+the resolvers costs one slice, and only on iterations that resolve something.
 
 ---
 
