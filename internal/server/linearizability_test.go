@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,6 +125,7 @@ func runSchedule(t *testing.T, seed int64, basePort int, snapshotThreshold ...ui
 	// it's what a first version of this harness actually did).
 	const callTimeout = 300 * time.Millisecond
 
+	var givenUp int64
 	var wg sync.WaitGroup
 	wg.Add(clients)
 	for c := 0; c < clients; c++ {
@@ -135,8 +137,31 @@ func runSchedule(t *testing.T, seed int64, basePort int, snapshotThreshold ...ui
 				// a client mid-partition still finds whichever side of the
 				// cluster is currently servicing writes/reads, exactly like
 				// cmd/quorum's client would by retrying against another node.
+				// A real client retries until it gets an answer; it does not
+				// give up after one pass over the node list. During a
+				// leaderless window, which the fault below creates on
+				// purpose, every node rejects a Propose or Get *instantly*
+				// with "not leader", so a client that makes one pass burns
+				// its whole operation budget in milliseconds and records
+				// nothing. That is what emptied histories in CI: one run
+				// recorded 1511 operations where a healthy run records 3000,
+				// and three schedules recorded none at all and failed the
+				// "harness is broken" assertion, which was pointing at the
+				// wrong thing. soak_test.go already worked this way; these
+				// two harnesses predate it and were never brought across.
+				deadline := time.Now().Add(8 * time.Second)
 			attempts:
-				for attempt := 0; attempt < len(servers); attempt++ {
+				for attempt := 0; ; attempt++ {
+					if attempt >= len(servers) {
+						// One full pass produced nothing. Back off and start
+						// another, unless we are out of time.
+						if time.Now().After(deadline) {
+							atomic.AddInt64(&givenUp, 1)
+							break attempts
+						}
+						time.Sleep(20 * time.Millisecond)
+						attempt = 0
+					}
 					s := servers[(clientID+attempt)%len(servers)]
 					if rng.Intn(2) == 0 {
 						value := fmt.Sprintf("c%d-i%d", clientID, i)
@@ -248,6 +273,9 @@ func runSchedule(t *testing.T, seed int64, basePort int, snapshotThreshold ...ui
 	}()
 
 	wg.Wait()
+	if n := atomic.LoadInt64(&givenUp); n > 0 {
+		t.Logf("%d operations gave up after 8s without reaching a leader", n)
+	}
 	return rec.Ops()
 }
 
@@ -269,7 +297,11 @@ func TestLinearizabilityAcrossFaultInjectedSchedules(t *testing.T) {
 		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
 			ops := runSchedule(t, seed, 19300+i*10)
 			if len(ops) == 0 {
-				t.Fatal("schedule recorded no operations at all; the chaos harness itself is broken")
+				// Every client now retries for 8s before giving up on an
+				// operation, so an empty history means the cluster held no
+				// leader for the whole schedule, not that a client wandered
+				// off during an election.
+				t.Fatal("schedule recorded no operations at all: no client reached a leader in 8s")
 			}
 			totalOps += len(ops)
 			for _, res := range checker.Check(ops) {
