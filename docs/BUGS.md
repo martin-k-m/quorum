@@ -3,9 +3,9 @@
 Real defects found in `quorum`, in the order I found them. Every entry names
 the mechanism, not the category, and names the thing that caught it.
 
-The pattern worth noticing: four of the six were caught by the linearizability
-checker, and three of the six were bugs in the testing apparatus itself rather
-than in the store. None of them were caught by reading the code, and I had read
+The pattern worth noticing: four of the seven were caught by the
+linearizability checker, and four of the seven were bugs in the testing
+apparatus itself rather than in the store. None of them were caught by reading the code, and I had read
 all of it.
 
 **A note on commit hashes.** `quorum` is committed one milestone at a time,
@@ -351,6 +351,57 @@ The trade-off rejected: publishing `Status` a second time, before resolving,
 would have fixed the same thing while making every iteration pay for two
 snapshots to serve a case that only matters when a proposal lands. Deferring
 the resolvers costs one slice, and only on iterations that resolve something.
+
+---
+
+## 7. Two chaos harnesses walked away from the cluster during an election
+
+**Symptom.** `TestLinearizabilityAcrossFaultInjectedSchedules` and
+`TestLinearizabilityAcrossMembershipChanges` failed intermittently on CI, at
+an assertion that says the harness is broken:
+
+```
+schedule recorded no operations at all; the chaos harness itself is broken
+```
+
+The run that failed on 19 Aug recorded **1511 operations where a healthy run
+records 3000**, with three schedules recording none at all. It never fails on
+this machine: 25 out of 25 schedules record the full 120 operations every time.
+
+**Root cause.** The harness, and the assertion was pointing at the wrong half
+of it. Each client made one pass over the three nodes and then consumed its
+operation. During a leaderless window, which the partition these tests inject
+creates on purpose, every node rejects a `Propose` or a `Get` *instantly* with
+"not leader", and neither of those paths records anything: the proposal never
+entered a log, so there is genuinely nothing to record. A client therefore
+burns its entire budget of thirty operations in a few milliseconds and records
+nothing at all. The cluster was fine. The harness stopped talking to it exactly
+when it got interesting, which is the opposite of what a chaos test is for.
+
+**Why it hid here.** It needs elections to be slow relative to the client, so
+it wants a loaded machine. On four contended CI cores it lost about half the
+operations in the run above; locally, elections settle well inside the client's
+first pass and nothing is ever lost.
+
+**The part that stings.** `soak_test.go` already fixed this, in M7, with a
+comment describing the same mechanism and the same symptom ("three to five
+schedules out of forty produced completely empty histories"). The fix was never
+carried back to the two harnesses that predate it.
+
+**Fix.** Both harnesses now retry an operation against the node list, with a
+20ms backoff between passes, until it is recorded or an 8s deadline passes,
+which is what `soak_test.go` does and what a real client does. Operations that
+give up are counted and logged rather than passing silently. With the same
+seeds, both harnesses now record their full history under a CPU load generator
+that starves the machine: 3018 and 2401 operations, against 1511 for the
+failing CI run.
+
+The assertion also no longer blames the harness. An empty history now means
+what it says: no client reached a leader in eight seconds.
+
+**What it taught me.** A fix to one harness is not a fix to the class. These
+three harnesses share a shape and were repaired one at a time, so the oldest
+two kept a defect the newest one had a written-up comment about.
 
 ---
 
