@@ -137,13 +137,16 @@ func TestPartitionHealReconcilesOverRealNetwork(t *testing.T) {
 	if ok, _, err := newLeader.Propose(fsm.EncodePut([]byte("after"), []byte("3"))); err != nil || !ok {
 		t.Fatalf("majority Propose(after): ok=%v err=%v", ok, err)
 	}
-	majorityCommitted := newLeader.Status().Committed
-
 	heal(ids, minority, majority)
 
+	// Read the majority's commit index inside the loop rather than sampling it
+	// once above: Propose resolves a proposal one statement before the loop
+	// publishes the Status that reflects it, so a sample taken on return is a
+	// commit index behind and the old leader overshoots it while catching up.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		st := leader.Status()
+		majorityCommitted := newLeader.Status().Committed
 		if st.Role != raft.Leader && st.Committed == majorityCommitted {
 			break
 		}

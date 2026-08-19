@@ -3,8 +3,8 @@
 Real defects found in `quorum`, in the order I found them. Every entry names
 the mechanism, not the category, and names the thing that caught it.
 
-The pattern worth noticing: four of the five were caught by the linearizability
-checker, and two of those were bugs in the checking apparatus itself rather
+The pattern worth noticing: four of the six were caught by the linearizability
+checker, and three of the six were bugs in the testing apparatus itself rather
 than in the store. None of them were caught by reading the code, and I had read
 all of it.
 
@@ -297,6 +297,60 @@ class of fix honest — it proves in-doubt operations are still constrained to
 their call time and cannot be used to explain away an arbitrary read. Without
 that guard, "record more things as in-doubt" would be a way to make any
 violation disappear, which would be a much worse bug than the one being fixed.
+
+---
+
+## 6. A test compared against a `Status` sample taken one commit too early
+
+**Symptom.** `TestPartitionHealReconcilesOverRealNetwork` failed on every run,
+CI included, from 18 Aug 2026 onwards:
+
+```
+old leader never reconciled: status={ID:3 Role:follower Term:2 Leader:1
+LastIndex:4 Committed:4 Applied:4 ...} want role!=Leader, committed=3
+```
+
+Read it closely and the failure is the wrong shape for the bug it names. The
+old leader had stepped down, adopted term 2, accepted node 1 as leader, and
+applied all four entries. It had reconciled. The number it was being held to,
+3, was the one that was wrong.
+
+**Root cause.** The test, not the store. `Server.Status` returns a snapshot the
+event loop publishes at the end of each iteration, and a proposal is resolved
+in `applyCommitted` earlier in that same iteration. So `Propose` returns to its
+caller before the loop reaches `publishStatus`, and a `Status` read on return
+is a commit index behind. The test sampled `newLeader.Status().Committed` at
+exactly that moment, got 3 rather than 4, then required the old leader to
+converge to it. The old leader converged to the true value and overshot the
+sample, forever.
+
+**Why it appeared when it did.** The race was there from M5, when the assertion
+was written, and did not lose once. Log compaction landed
+`s.maybeCompact()` between `applyCommitted` and `publishStatus` (`c55f7a5`,
+found by bisect), which widened the window between the two enough that the
+sampling goroutine now loses every time. The snapshotting work did not break
+anything; it made a latent test race deterministic, which is the more useful
+of the two outcomes.
+
+**Fix.** Read the majority leader's commit index inside the wait loop rather
+than sampling it once before healing. The assertion is unchanged in what it
+demands: the old leader must step down and hold the same committed index as
+the new leader. It just compares against a live value instead of a stale one.
+
+**The cause underneath, fixed too.** Repairing the assertion leaves the
+footgun that produced it: any caller that proposes and then reads `Status`
+expecting to see its own write had the same bug this test did, and after
+compaction the gap is as wide as taking a snapshot. `applyCommitted` now
+returns the resolvers rather than running them, and the loop runs them after
+`publishStatus`, so a caller cannot wake to a `Status` older than the entry it
+was waiting for. `TestStatusReflectsAProposalByTheTimeItReturns` proposes 50
+entries and reads `Status` on each return; it fails at iteration 3 without the
+reordering.
+
+The trade-off rejected: publishing `Status` a second time, before resolving,
+would have fixed the same thing while making every iteration pay for two
+snapshots to serve a case that only matters when a proposal lands. Deferring
+the resolvers costs one slice, and only on iterations that resolve something.
 
 ---
 
