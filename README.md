@@ -158,12 +158,16 @@ demonstrates it rather than asserting it:
 | The log is crash-safe | `TestCrashMidWriteRecoversTheValidPrefix` — truncates the log at every byte offset and checks recovery yields a clean prefix |
 | Applied state survives restart | `TestRestartRecoversAppliedState` |
 
-Two limits on the word "durable" worth stating plainly: an entry is fsynced
-before it is acknowledged, but **the log is never compacted**, so a
-long-running node will fill its disk and restart time grows with total writes
-ever performed (see [DECISIONS.md](docs/DECISIONS.md) §2). And the
-linearizability evidence is a large number of checked randomized histories, not
-a proof: it means no violation has been found, not that none exists.
+Two limits on the word "durable" worth stating plainly. An entry is fsynced
+before it is acknowledged, and the log **is** compacted, but **compaction is
+off by default**: `SnapshotThreshold` is zero unless the caller sets it, and a
+node left at the default grows its log without bound and pays a restart time
+that grows with every write ever performed. Turned on, that is a 5,889,055-byte
+log against 53,862 bytes of snapshot plus tail, and a 97 ms replay against 10 ms
+(see [BENCHMARKS.md](docs/BENCHMARKS.md#log-compaction) and
+[DECISIONS.md](docs/DECISIONS.md) §2). And the linearizability evidence is a
+large number of checked randomized histories, not a proof: it means no
+violation has been found, not that none exists.
 
 All tests pass under `go test -race ./...`, repeatedly.
 
