@@ -13,8 +13,9 @@ so a bug found while building a milestone and fixed before that milestone
 landed does not have its own isolated fix diff — the fix is part of the
 milestone commit. Where that is the case I say so and point at the earlier
 commit where the defective code is still visible, so the claim is checkable
-rather than something you have to take from the commit message. Bug 4 has its
-own commit, because it was found after the code it broke had already shipped.
+rather than something you have to take from the commit message. Bugs 4 through 7
+have their own commits, because each was found after the code it broke had
+already shipped.
 
 ---
 
@@ -268,8 +269,9 @@ write that returned an error may still commit." I fixed the first, wrote it up
 as a lesson about modelling unknown outcomes, and then left the same hole open
 one branch of the same `switch` statement away.
 
-**Fix.** Not yet committed to a milestone commit at the time of writing; it is
-part of the `harden/evidence` work. All three chaos harnesses now record a Put
+**Fix.** `730daf3` (`A randomized soak, and the harness bug it found on its
+first run`), which is the commit that introduced the soak and repaired the two
+older harnesses in the same diff. All three chaos harnesses now record a Put
 as in-doubt for *any* outcome that is not a definite success or a definite
 "not the leader, nothing appended":
 
@@ -332,12 +334,14 @@ sampling goroutine now loses every time. The snapshotting work did not break
 anything; it made a latent test race deterministic, which is the more useful
 of the two outcomes.
 
-**Fix.** Read the majority leader's commit index inside the wait loop rather
-than sampling it once before healing. The assertion is unchanged in what it
+**Fix.** `c7f8464` (`Compare against a live commit index in the partition-heal
+test, not a stale one`). Read the majority leader's commit index inside the wait
+loop rather than sampling it once before healing. The assertion is unchanged in what it
 demands: the old leader must step down and hold the same committed index as
 the new leader. It just compares against a live value instead of a stale one.
 
-**The cause underneath, fixed too.** Repairing the assertion leaves the
+**The cause underneath, fixed too.** `51632aa` (`Publish Status before resolving
+a proposal, not after`). Repairing the assertion leaves the
 footgun that produced it: any caller that proposes and then reads `Status`
 expecting to see its own write had the same bug this test did, and after
 compaction the gap is as wide as taking a snapshot. `applyCommitted` now
@@ -388,7 +392,8 @@ comment describing the same mechanism and the same symptom ("three to five
 schedules out of forty produced completely empty histories"). The fix was never
 carried back to the two harnesses that predate it.
 
-**Fix.** Both harnesses now retry an operation against the node list, with a
+**Fix.** `6dc3675` (`Retry an operation until it reaches a leader, in both chaos
+harnesses`). Both harnesses now retry an operation against the node list, with a
 20ms backoff between passes, until it is recorded or an 8s deadline passes,
 which is what `soak_test.go` does and what a real client does. Operations that
 give up are counted and logged rather than passing silently. With the same
@@ -421,6 +426,20 @@ reproducible with:
 go test ./internal/server/ -run TestLinearizabilitySoak \
   -quorum.soak -quorum.soak.seeds=200 -quorum.soak.seedbase=70000 -v
 ```
+
+Re-run since, on 250 schedules the harness had never seen, to check that the
+clean result was not an artefact of those particular seeds:
+
+```sh
+go test ./internal/server/ -run TestLinearizabilitySoak \
+  -quorum.soak -quorum.soak.seeds=250 -quorum.soak.seedbase=900000 \
+  -timeout 180m -v
+```
+
+250 schedules, seeds 900000-900249, alternating 3 and 5 nodes, 385.8 s, **0
+linearizability violations**. Every schedule passed. I did not keep the total
+operation count from that run, so the 48,443 above still refers to the 70000
+range; these seeds add coverage, not a counted total.
 
 That is a weaker statement than it may look, and it is worth saying plainly: it
 means no violation has been found, not that none exists. Every bug on this page
