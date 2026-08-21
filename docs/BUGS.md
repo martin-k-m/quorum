@@ -427,6 +427,20 @@ go test ./internal/server/ -run TestLinearizabilitySoak \
   -quorum.soak -quorum.soak.seeds=200 -quorum.soak.seedbase=70000 -v
 ```
 
+Re-run since, on 250 schedules the harness had never seen, to check that the
+clean result was not an artefact of those particular seeds:
+
+```sh
+go test ./internal/server/ -run TestLinearizabilitySoak \
+  -quorum.soak -quorum.soak.seeds=250 -quorum.soak.seedbase=900000 \
+  -timeout 180m -v
+```
+
+250 schedules, seeds 900000-900249, alternating 3 and 5 nodes, 385.8 s, **0
+linearizability violations**. Every schedule passed. I did not keep the total
+operation count from that run, so the 48,443 above still refers to the 70000
+range; these seeds add coverage, not a counted total.
+
 That is a weaker statement than it may look, and it is worth saying plainly: it
 means no violation has been found, not that none exists. Every bug on this page
 was invisible until the specific fault that exposed it was added to a harness,
