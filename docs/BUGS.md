@@ -413,9 +413,10 @@ two kept a defect the newest one had a written-up comment about.
 
 ## 8. Four `internal/server` tests lose the leader under the nightly's repeat
 
-**Status: open.** No root cause and no fix. Recorded because the nightly has
-been red for most of a week and the reason should be written down rather than
-rediscovered.
+**Status: fixed in the tests, unconfirmed on the runner.** `7fcae31`. The
+defect was in what the tests assume, not in the store. Whether it is the whole
+of what the nightly hits will not be known until the nightly has run green for
+several nights, and this entry should be revisited then rather than closed now.
 
 **Symptom.** The nightly's third job, `full suite, repeated`, which runs
 `go test ./... -race -count=5 -timeout 25m`, fails in `internal/server`. Four
@@ -492,10 +493,38 @@ the leader is genuinely less stable now, the answer is either to reduce what the
 new features cost an election or to make the tests tolerate a re-election
 honestly — not to raise a timeout until the failure stops appearing.
 
-**What would settle it.** The failure is CI-only, so it wants the runner rather
-than this machine: capture the leadership transitions and the election timing
-from a failing nightly, and find out why the leader is not surviving these four
-tests when it survives the same code at `-count=1`.
+**Fix.** `7fcae31`. Three of the four held a single leader handle across a loop
+of 20, 50 or 400 writes; the fourth retried a membership change but only past
+`ErrLeaderNotReady`, so `ErrNotLeader` went straight to `t.Fatalf`. All four now
+put each write through whichever node leads at that moment, via a
+`putThroughLeader` helper, and the membership change re-resolves the leader on
+every pass — asking a node that is staying, since the one being dropped must not
+propose its own removal. The three that follow their writes with `AddLearner`,
+`AddNode` or `Status` re-resolve first, because the writes may have outlived the
+term they started in.
+
+No deadline was widened and no assertion was weakened, which was the whole
+constraint: these tests are about compaction, learners and cluster growth, and a
+re-election is a thing they should survive rather than a thing they should
+notice. It is the same repair
+[#7](#7-two-chaos-harnesses-walked-away-from-the-cluster-during-an-election) made
+to the chaos harnesses, and the third time in this file a test has been found
+asserting on its environment rather than on the store.
+
+Retrying is only sound because every command in these four is an idempotent put.
+A lost-leadership error leaves a proposal in doubt rather than refused (§4, §5),
+so a retry can apply it twice, and the helper's comment says so — the same
+reasoning applied to a non-idempotent command would reintroduce the bug §4
+exists to record.
+
+**What it is verified against, and what it is not.** A scratch test, not kept,
+stopped the leader part-way through sixty writes: the old pattern fails at the
+write where the leader goes away, the helper completes all sixty. So the
+mechanism works. That is a harsher event than the runner produces — `server:
+stopped` rather than an election moving under load — so it demonstrates the
+mechanism and not the trigger. The failure was never reproduced on this machine
+at all: sixteen cores, `GOMAXPROCS=2` and `GOMAXPROCS=1`, all clean at
+`-race -count=5`. Only the nightly can confirm the fix.
 
 ---
 
