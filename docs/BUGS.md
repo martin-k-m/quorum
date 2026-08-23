@@ -3,9 +3,10 @@
 Real defects found in `quorum`, in the order I found them. Every entry names
 the mechanism, not the category, and names the thing that caught it.
 
-The pattern worth noticing: four of the seven were caught by the
-linearizability checker, and four of the seven were bugs in the testing
-apparatus itself rather than in the store. None of them were caught by reading the code, and I had read
+The pattern worth noticing: four of the eight were caught by the
+linearizability checker, and four of the eight were bugs in the testing
+apparatus itself rather than in the store. The eighth is open, and which of
+those two it belongs to is exactly what is not yet known. None of them were caught by reading the code, and I had read
 all of it.
 
 **A note on commit hashes.** `quorum` is committed one milestone at a time,
@@ -15,7 +16,7 @@ milestone commit. Where that is the case I say so and point at the earlier
 commit where the defective code is still visible, so the claim is checkable
 rather than something you have to take from the commit message. Bugs 4 through 7
 have their own commits, because each was found after the code it broke had
-already shipped.
+already shipped. Bug 8 has no fix commit yet, because it has no fix.
 
 ---
 
@@ -407,6 +408,74 @@ what it says: no client reached a leader in eight seconds.
 **What it taught me.** A fix to one harness is not a fix to the class. These
 three harnesses share a shape and were repaired one at a time, so the oldest
 two kept a defect the newest one had a written-up comment about.
+
+---
+
+## 8. Four `internal/server` tests lose the leader under the nightly's repeat
+
+**Status: open.** No root cause and no fix. Recorded because the nightly has
+been red for most of a week and the reason should be written down rather than
+rediscovered.
+
+**Symptom.** The nightly's third job, `full suite, repeated`, which runs
+`go test ./... -race -count=5 -timeout 25m`, fails in `internal/server`. Four
+tests, and every one of them is about leadership:
+
+```
+snapshot_test.go:276  ChangeMembership: raft: not the leader
+snapshot_test.go:91   Propose 0:  ok=false err=<nil>
+learner_test.go:67    Propose 11: ok=false err=server: proposal was not committed
+                                  (this node lost leadership, or the server
+                                  stopped, before it did)
+learner_test.go:109   Propose 16: ok=false err=server: proposal was not committed
+                                  (this node lost leadership, or the server
+                                  stopped, before it did)
+```
+
+They fail *fast* — 0.35s to 0.58s — so nothing is timing out. The leader is
+being lost early, and the tests assume it will still be there.
+
+**One of the four is not like the others.** `snapshot_test.go:91` reports
+`ok=false` with `err=<nil>`: a proposal that failed while reporting no error at
+all. The other three carry a real error string. That is either a second path or
+a place where the leadership-loss error is not propagated, and it is answerable
+by reading rather than by running.
+
+**Frequency.** Five of the last seven nightlies: 18, 19, 21, 22 and 23 August
+red; 17 and 20 August green. The push CI is green throughout, because it runs
+`-count=1` rather than `-count=5`.
+
+**It is not the history rewrite.** The nightly of 22 August failed at `e1f6e8a`,
+which is the pre-rewrite head. It was already failing before the repository's
+commits were rewritten.
+
+**Not reproduced locally.** At `5d2622d`, `go test ./internal/server -race
+-count=5 -timeout 25m` passes with zero failures, both at this machine's sixteen
+logical cores and pinned to `GOMAXPROCS=2` to approximate the runner. 148s and
+147s respectively. Constraining core count is not sufficient to provoke it, so
+whatever the runner does to these tests is not simply having fewer CPUs.
+
+**How it relates to [#7](#7-two-chaos-harnesses-walked-away-from-the-cluster-during-an-election).**
+Same family, different mechanism, and I am not assuming they share a cause. #7
+was the *harness* giving up while the cluster was fine. Here the cluster itself
+reports losing leadership, and the tests that notice are the ones covering the
+three features most recently added to `internal/server`: compaction, learners,
+and growing the cluster. The obvious hypothesis is that the new work made
+elections less stable inside the windows these tests assume, but that is a
+hypothesis and nothing here tests it.
+
+**How it should not be fixed.** Not by widening the windows. #7 was repaired by
+making the client behave like a real client, retrying until it reached a leader,
+rather than by giving the assertion more room; the assertion was the valuable
+part. The same applies here: if these tests are asserting on a stable leader and
+the leader is genuinely less stable now, the answer is either to reduce what the
+new features cost an election or to make the tests tolerate a re-election
+honestly — not to raise a timeout until the failure stops appearing.
+
+**What would settle it.** The failure is CI-only, so it wants the runner rather
+than this machine: capture the leadership transitions and the election timing
+from a failing nightly, and check whether the `<nil>` error at
+`snapshot_test.go:91` is a distinct path.
 
 ---
 
