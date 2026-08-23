@@ -435,11 +435,31 @@ learner_test.go:109   Propose 16: ok=false err=server: proposal was not committe
 They fail *fast* — 0.35s to 0.58s — so nothing is timing out. The leader is
 being lost early, and the tests assume it will still be there.
 
-**One of the four is not like the others.** `snapshot_test.go:91` reports
-`ok=false` with `err=<nil>`: a proposal that failed while reporting no error at
-all. The other three carry a real error string. That is either a second path or
-a place where the leadership-loss error is not propagated, and it is answerable
-by reading rather than by running.
+**The `<nil>` error is not a dropped one.** `snapshot_test.go:91` reports
+`ok=false` with no error, which looks like a missing error until you read the
+path. `Propose` has three outcomes, and the one at `server.go:554` fires when
+the node is not the leader as the batch is drained:
+
+```go
+if s.node.Role() != raft.Leader {
+    lead := s.node.Lead()
+    for _, r := range batch {
+        r.resp <- proposeResult{leader: lead}   // applied=false, err=nil
+    }
+    continue
+}
+```
+
+That is the documented contract — *"rejected because this node is not currently
+the leader (in which case leaderHint, if nonzero, names who is)"* — and it
+answers with a hint rather than an error on purpose. So all four failures are
+one phenomenon, not three plus an oddity: the leader changed. Three of them
+noticed after their entry was appended and lost, and this one noticed before it
+was ever proposed.
+
+What the test does with that is its own assumption. `snapshot_test.go:91` treats
+`!ok` as fatal without consulting `leaderHint`, which is reasonable only while
+the leader is guaranteed stable for four hundred writes.
 
 **Frequency.** Five of the last seven nightlies: 18, 19, 21, 22 and 23 August
 red; 17 and 20 August green. The push CI is green throughout, because it runs
@@ -474,8 +494,8 @@ honestly — not to raise a timeout until the failure stops appearing.
 
 **What would settle it.** The failure is CI-only, so it wants the runner rather
 than this machine: capture the leadership transitions and the election timing
-from a failing nightly, and check whether the `<nil>` error at
-`snapshot_test.go:91` is a distinct path.
+from a failing nightly, and find out why the leader is not surviving these four
+tests when it survives the same code at `-count=1`.
 
 ---
 
