@@ -63,11 +63,12 @@ func TestLearnerReplicatesWithoutJoiningTheQuorum(t *testing.T) {
 	joiner := extra[0]
 
 	for i := 0; i < 20; i++ {
-		if ok, _, err := leader.Propose(fsm.EncodePut([]byte(fmt.Sprintf("k%d", i)), []byte("v"))); err != nil || !ok {
-			t.Fatalf("Propose %d: ok=%v err=%v", i, ok, err)
-		}
+		putThroughLeader(t, voting, fsm.EncodePut([]byte(fmt.Sprintf("k%d", i)), []byte("v")), 10*time.Second)
 	}
 
+	// Only the leader may add a learner, and the writes above may have outlived
+	// the term they started in.
+	leader = awaitLeader(t, voting, 5*time.Second)
 	if _, _, err := leader.AddLearner(joiner.cfg.ID); err != nil {
 		t.Fatalf("AddLearner: %v", err)
 	}
@@ -105,11 +106,12 @@ func TestGrowingTheClusterKeepsToleratingOneFailure(t *testing.T) {
 	joiner := extra[0]
 
 	for i := 0; i < 50; i++ {
-		if ok, _, err := leader.Propose(fsm.EncodePut([]byte(fmt.Sprintf("k%d", i)), []byte("v"))); err != nil || !ok {
-			t.Fatalf("Propose %d: ok=%v err=%v", i, ok, err)
-		}
+		putThroughLeader(t, voting, fsm.EncodePut([]byte(fmt.Sprintf("k%d", i)), []byte("v")), 10*time.Second)
 	}
 
+	// Only the leader may grow the cluster, and the writes above may have
+	// outlived the term they started in.
+	leader = awaitLeader(t, voting, 5*time.Second)
 	if err := leader.AddNode(joiner.cfg.ID, 4, 20*time.Second); err != nil {
 		t.Fatalf("AddNode: %v", err)
 	}

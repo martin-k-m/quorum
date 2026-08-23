@@ -68,6 +68,35 @@ func awaitLeader(t *testing.T, servers []*Server, timeout time.Duration) *Server
 	return nil
 }
 
+// putThroughLeader replicates one command through whichever node is the leader
+// now, rather than through the node that was the leader when the test started.
+// A re-election part-way through a test is normal on a loaded machine, and a
+// test that treats one as a failure is asserting on the schedule rather than on
+// the thing it is meant to cover. This is what the chaos harnesses were taught
+// to do in docs/BUGS.md §7, and what a real client does.
+//
+// Only sound for a command that may be applied twice. A lost-leadership error
+// leaves the proposal in doubt (§4, §5), so retrying it can apply it twice;
+// every caller here writes a fixed key to a fixed value.
+func putThroughLeader(t *testing.T, servers []*Server, data []byte, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last error
+	for time.Now().Before(deadline) {
+		for _, s := range servers {
+			ok, _, err := s.Propose(data)
+			if ok {
+				return
+			}
+			if err != nil {
+				last = err
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no node accepted the proposal within %s: last error %v", timeout, last)
+}
+
 func TestThreeNodeClusterElectsALeader(t *testing.T) {
 	servers := cluster(t, 3, 19100)
 	leader := awaitLeader(t, servers, 5*time.Second)

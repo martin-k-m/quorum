@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,13 +85,10 @@ func TestLogStopsGrowingOnceCompactionIsOn(t *testing.T) {
 
 	value := make([]byte, 512)
 	for i := 0; i < 400; i++ {
-		ok, _, err := leader.Propose(fsm.EncodePut([]byte(fmt.Sprintf("k%d", i%16)), value))
-		if err != nil || !ok {
-			t.Fatalf("Propose %d: ok=%v err=%v", i, ok, err)
-		}
+		putThroughLeader(t, servers, fsm.EncodePut([]byte(fmt.Sprintf("k%d", i%16)), value), 10*time.Second)
 	}
 
-	st := leader.Status()
+	st := awaitLeader(t, servers, 5*time.Second).Status()
 	if st.SnapshotIndex == 0 {
 		t.Fatal("400 writes past a threshold of 32 produced no snapshot")
 	}
@@ -266,19 +262,33 @@ func TestMembershipSurvivesCompactionAcrossACluster(t *testing.T) {
 	// in its own term, so a change proposed immediately after an election can
 	// legitimately be refused. Retry rather than treat that as a failure: the
 	// alternative is a test that fails whenever the election is fast.
+	//
+	// Re-resolve the leader on every pass rather than reusing the one found
+	// above: a re-election moves it, and only the leader may begin the change.
+	// Ask a node that is staying, since the node being dropped must not propose
+	// its own removal. Any error is retried until the deadline and the last one
+	// is reported, because a change that lost leadership part-way is in doubt
+	// rather than refused, and re-proposing the same membership is a no-op if it
+	// did commit.
 	deadline := time.Now().Add(10 * time.Second)
 	var changeErr error
-	for time.Now().Before(deadline) {
-		if _, _, changeErr = leader.ChangeMembership(keep); changeErr == nil {
+	changed := false
+	for !changed && time.Now().Before(deadline) {
+		for _, s := range servers {
+			if s.cfg.ID == drop || s.Status().Role != raft.Leader {
+				continue
+			}
+			if _, _, changeErr = s.ChangeMembership(keep); changeErr == nil {
+				changed = true
+			}
 			break
 		}
-		if !errors.Is(changeErr, raft.ErrLeaderNotReady) {
-			t.Fatalf("ChangeMembership: %v", changeErr)
+		if !changed {
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	if changeErr != nil {
-		t.Fatalf("ChangeMembership never became ready: %v", changeErr)
+	if !changed {
+		t.Fatalf("ChangeMembership never succeeded: last error %v", changeErr)
 	}
 	awaitStatus(t, leader, 10*time.Second, func(st Status) bool {
 		return !st.Config.IsJoint() && len(st.Config.Voters) == 2
