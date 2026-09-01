@@ -53,9 +53,14 @@ func TestPartitionMinorityCannotCommitOverRealNetwork(t *testing.T) {
 
 	// Commit one value before the partition so there is a known-good
 	// baseline commit index to check the minority never advances past.
-	if ok, _, err := leader.Propose(fsm.EncodePut([]byte("before"), []byte("1"))); err != nil || !ok {
-		t.Fatalf("Propose(before): ok=%v err=%v", ok, err)
-	}
+	//
+	// Through whichever node leads rather than the handle above: the cluster
+	// has just elected, a first term can be short on a loaded runner, and the
+	// nightly of 2026-09-01 lost this write that way. The leader is then
+	// re-resolved, because which node is isolated below has to be the one
+	// leading now.
+	putThroughLeader(t, servers, fsm.EncodePut([]byte("before"), []byte("1")), 10*time.Second)
+	leader = awaitLeader(t, servers, 5*time.Second)
 	baseline := leader.Status().Committed
 	if baseline == 0 {
 		t.Fatal("baseline commit index is 0; the setup itself is broken")
@@ -111,9 +116,10 @@ func TestPartitionHealReconcilesOverRealNetwork(t *testing.T) {
 	ids := byID(servers)
 	leader := awaitLeader(t, servers, 5*time.Second)
 
-	if ok, _, err := leader.Propose(fsm.EncodePut([]byte("before"), []byte("1"))); err != nil || !ok {
-		t.Fatalf("Propose(before): ok=%v err=%v", ok, err)
-	}
+	// The same reason as the test above: this write goes through whoever leads,
+	// and the node to isolate is resolved after it rather than before.
+	putThroughLeader(t, servers, fsm.EncodePut([]byte("before"), []byte("1")), 10*time.Second)
+	leader = awaitLeader(t, servers, 5*time.Second)
 
 	var majority []uint64
 	minority := []uint64{leader.cfg.ID}

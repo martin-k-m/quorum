@@ -413,10 +413,11 @@ two kept a defect the newest one had a written-up comment about.
 
 ## 8. Four `internal/server` tests lose the leader under the nightly's repeat
 
-**Status: fixed in the tests, unconfirmed on the runner.** `7fcae31`. The
-defect was in what the tests assume, not in the store. Whether it is the whole
-of what the nightly hits will not be known until the nightly has run green for
-several nights, and this entry should be revisited then rather than closed now.
+**Status: the fix held for the four tests it named, and the class is wider than
+those four.** `7fcae31` fixed what it fixed and nothing in it is wrong. The
+defect was in what the tests assume, not in the store. The nightly record since
+is at the bottom of this entry, along with the three further tests it caught,
+which were the same assumption in tests nobody had looked at yet.
 
 **Symptom.** The nightly's third job, `full suite, repeated`, which runs
 `go test ./... -race -count=5 -timeout 25m`, fails in `internal/server`. Four
@@ -525,6 +526,56 @@ stopped` rather than an election moving under load — so it demonstrates the
 mechanism and not the trigger. The failure was never reproduced on this machine
 at all: sixteen cores, `GOMAXPROCS=2` and `GOMAXPROCS=1`, all clean at
 `-race -count=5`. Only the nightly can confirm the fix.
+
+**The nightly since, and what it caught.** Read on 2026-09-01, all at
+`1f1ee0e`: 24 August red, then eight consecutive greens from the 25th to the
+31st, then 1 September red. So the four tests `7fcae31` repaired have not failed
+again — and three others have, with the same sentence in the log:
+
+```
+snapshot_test.go:106         Get after compaction: found=false len=0
+                             err=server: not currently the leader
+fault_injection_test.go:57   Propose(before): ok=false err=server: proposal was
+                             not committed (this node lost leadership …)
+status_freshness_test.go:23  Propose 32: ok=false err=server: proposal was not
+                             committed (this node lost leadership …)
+```
+
+That is one phenomenon in three places, and it is this entry's phenomenon: a
+test holding the handle it opened with across an election. What is new is only
+where it turned up, because `7fcae31` converted the four tests that were failing
+rather than every test that could.
+
+- **`TestLogStopsGrowingOnceCompactionIsOn`** already put its four hundred
+  writes through `putThroughLeader`, and then read the result back through the
+  handle it opened with. `Get` is served by the leader, so the read asserts no
+  election happened across four hundred writes — which is exactly what the
+  writes above it had stopped asserting. It now re-resolves the leader for the
+  status and the log-size check, and reads through a new `getThroughLeader`,
+  the read half of the same helper.
+- **`TestStatusReflectsAProposalByTheTimeItReturns`** cannot use
+  `putThroughLeader`, because its claim is about one node: the node that
+  accepted the proposal must already show it. So the loop resolves the leader
+  each iteration, reads its index, proposes through it, and asks that same node.
+  A proposal that loses leadership is retried rather than fatal — bounded at
+  twenty, so a cluster that cannot hold a leader fails the test instead of
+  running until the suite's timeout kills it with no explanation.
+- **The two partition tests** each committed a baseline value through the handle
+  from `awaitLeader` immediately after the cluster elected, when a first term is
+  at its shortest. Both now write through whoever leads and re-resolve
+  afterwards, because the node they isolate has to be the one leading *now*.
+
+No deadline widened, no assertion weakened, and the same soundness argument as
+before: every one of these is an idempotent put, and a lost-leadership error
+leaves a proposal in doubt (§4, §5) rather than refused.
+
+**What that leaves.** Every remaining `leader.Propose` in `internal/server`'s
+tests is the same shape and has not failed, so nothing was changed there: the
+three above were converted because the nightly named them, not because a sweep
+found them. If a fourth turns up, it is this entry again rather than a new one.
+The underlying question this entry raised is still open and still worth asking —
+whether compaction and learners made elections genuinely less stable, or whether
+the runner is simply loaded — and none of this test work answers it.
 
 ---
 

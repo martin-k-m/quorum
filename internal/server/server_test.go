@@ -97,6 +97,35 @@ func putThroughLeader(t *testing.T, servers []*Server, data []byte, timeout time
 	t.Fatalf("no node accepted the proposal within %s: last error %v", timeout, last)
 }
 
+// getThroughLeader reads one key from whichever node is the leader now.
+//
+// The read half of putThroughLeader, and needed for the same reason: `Get` is
+// served by the leader, so a test that reads through the handle it opened with
+// is asserting that no election happened in between. A linearizable read is
+// safe to repeat, so retrying costs nothing but the attempt.
+func getThroughLeader(
+	t *testing.T,
+	servers []*Server,
+	key []byte,
+	timeout time.Duration,
+) ([]byte, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last error
+	for time.Now().Before(deadline) {
+		for _, s := range servers {
+			v, found, _, err := s.Get(key)
+			if err == nil {
+				return v, found
+			}
+			last = err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no node served the read within %s: last error %v", timeout, last)
+	return nil, false
+}
+
 func TestThreeNodeClusterElectsALeader(t *testing.T) {
 	servers := cluster(t, 3, 19100)
 	leader := awaitLeader(t, servers, 5*time.Second)
