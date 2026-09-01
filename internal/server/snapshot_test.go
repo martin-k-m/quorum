@@ -88,7 +88,11 @@ func TestLogStopsGrowingOnceCompactionIsOn(t *testing.T) {
 		putThroughLeader(t, servers, fsm.EncodePut([]byte(fmt.Sprintf("k%d", i%16)), value), 10*time.Second)
 	}
 
-	st := awaitLeader(t, servers, 5*time.Second).Status()
+	// Whichever node leads now, which need not be the one that led when the
+	// writes started: four hundred of them is long enough for an election on a
+	// loaded runner, and the nightly of 2026-09-01 had one.
+	leader = awaitLeader(t, servers, 5*time.Second)
+	st := leader.Status()
 	if st.SnapshotIndex == 0 {
 		t.Fatal("400 writes past a threshold of 32 produced no snapshot")
 	}
@@ -101,9 +105,9 @@ func TestLogStopsGrowingOnceCompactionIsOn(t *testing.T) {
 	}
 
 	// And the data is still there and still readable.
-	v, found, _, err := leader.Get([]byte("k3"))
-	if err != nil || !found || len(v) != 512 {
-		t.Fatalf("Get after compaction: found=%v len=%d err=%v", found, len(v), err)
+	v, found := getThroughLeader(t, servers, []byte("k3"), 10*time.Second)
+	if !found || len(v) != 512 {
+		t.Fatalf("Get after compaction: found=%v len=%d", found, len(v))
 	}
 }
 
