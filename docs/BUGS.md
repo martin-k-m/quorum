@@ -634,8 +634,17 @@ linearizability violations found.
 ```
 
 ```sh
-go test ./internal/server/ -run TestLinearizabilityAcrossACrashDuringAMembershipChange -v
+go test ./internal/server/ \
+  -run TestLinearizabilityAcrossACrashDuringAMembershipChange \
+  -quorum.reconfig-crash -v
 ```
+
+It is gated behind that flag and runs in the nightly, not in `go test ./...`.
+CI runs the ordinary suite with `-race -timeout 10m`, and five servers per
+schedule with crash-restarts under the race detector does not fit inside it
+alongside everything else: ungated, it took `internal/server` past ten minutes,
+which CI reports as a hang rather than as a failure with a message. Gated, that
+package runs in 106 s.
 
 The crash is aimed rather than timed. A membership change commits in two steps,
 and between them the cluster decides by a majority of the old voters *and* a

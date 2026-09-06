@@ -42,6 +42,39 @@ jobs:
             -quorum.soak -quorum.soak.seeds=200 -quorum.soak.seedbase=70000 \
             -race -v -timeout 55m
 
+  reconfig-crash:
+    name: crash during reconfiguration
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+
+      # The soak crashes nodes and never reconfigures; the membership tests
+      # reconfigure and never crash. This is the overlap docs/BUGS.md named as
+      # the most likely place for the next real bug: a crash-restart while the
+      # configuration is joint, when a decision needs a majority of the old
+      # voters and a majority of the new ones at the same time.
+      #
+      # Its own job rather than a step in the soak's, because that one is capped
+      # at sixty minutes and already spends fifty-five of them.
+      #
+      # A single failing schedule re-runs with:
+      #   go test ./internal/server/ -run TestLinearizabilityAcrossACrashDuringAMembershipChange \
+      #     -quorum.reconfig-crash -quorum.reconfig-crash.seedbase=<seed> \
+      #     -quorum.reconfig-crash.schedules=1 -v
+      - name: Crash during reconfiguration
+        run: |
+          go test ./internal/server/ \
+            -run TestLinearizabilityAcrossACrashDuringAMembershipChange \
+            -quorum.reconfig-crash -quorum.reconfig-crash.schedules=40 \
+            -quorum.reconfig-crash.seedbase=31000 \
+            -race -v -timeout 40m
+
   measure:
     name: election timing and partition heal
     runs-on: ubuntu-latest

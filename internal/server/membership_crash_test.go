@@ -1,6 +1,7 @@
 package server
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -47,15 +48,32 @@ import (
 // leader is being killed is not a bug, and the harness says so rather than
 // failing. What would be a bug is a history in which a read misses a write that
 // a client was told had committed.
+// Gated behind -quorum.reconfig-crash, and the reason is the same one the soak
+// has: CI runs `go test ./... -race -timeout 10m`, and twelve schedules of five
+// servers with crash-restarts under the race detector do not fit in that budget
+// alongside everything else in this package. The first version of this test was
+// not gated and pushed internal/server past ten minutes, which is a hang from
+// CI's point of view rather than a failure with a message.
+//
+// The nightly runs it; see .github/workflows/nightly.yml.
+var (
+	reconfigCrash = flag.Bool("quorum.reconfig-crash", false,
+		"run the crash-during-reconfiguration linearizability schedules (slow)")
+	reconfigCrashSchedules = flag.Int("quorum.reconfig-crash.schedules", 12,
+		"number of crash-during-reconfiguration schedules to run")
+	reconfigCrashSeedBase = flag.Int64("quorum.reconfig-crash.seedbase", 31000,
+		"first seed; a failing seed can be re-run alone with -quorum.reconfig-crash.schedules=1")
+)
+
 func TestLinearizabilityAcrossACrashDuringAMembershipChange(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping the crash-during-reconfiguration run in -short mode")
+	if !*reconfigCrash {
+		t.Skip("skipping: pass -quorum.reconfig-crash to run the crash-during-reconfiguration schedules")
 	}
-	const schedules = 12
-	const seedBase = 31000
+	schedules := *reconfigCrashSchedules
+	seedBase := *reconfigCrashSeedBase
 	totalOps, inDoubt, violations, jointHits := 0, 0, 0, 0
 	for i := 0; i < schedules; i++ {
-		seed := int64(seedBase + i)
+		seed := seedBase + int64(i)
 		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
 			ops, sawJoint := runCrashDuringMembershipSchedule(t, seed, 21500+i*10)
 			if sawJoint {
@@ -86,7 +104,7 @@ func TestLinearizabilityAcrossACrashDuringAMembershipChange(t *testing.T) {
 	// outside the joint window every time and proved only what the soak already
 	// proves.
 	t.Logf("%d crash-during-reconfiguration schedules checked (seeds %d-%d), %d operations (%d in doubt), %d caught the cluster in a joint configuration, %d linearizability violations found",
-		schedules, seedBase, seedBase+schedules-1, totalOps, inDoubt, jointHits, violations)
+		schedules, seedBase, seedBase+int64(schedules)-1, totalOps, inDoubt, jointHits, violations)
 	if jointHits == 0 {
 		t.Errorf("no schedule crashed a node while the configuration was joint: this run exercised nothing the soak does not")
 	}
