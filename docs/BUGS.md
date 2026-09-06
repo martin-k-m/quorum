@@ -623,4 +623,43 @@ membership change inside the soak — membership churn is exercised separately b
 
 The most likely place for the next real bug, given where the existing four sit,
 is the interaction between a membership change and a crash-restart of a node
-mid-configuration-change. Nothing currently exercises both at once.
+mid-configuration-change. **That gap is now covered**, by
+`TestLinearizabilityAcrossACrashDuringAMembershipChange` in
+`internal/server/membership_crash_test.go`, and it has found nothing so far:
+
+```
+12 crash-during-reconfiguration schedules (seeds 31000-31011), 1,920 operations
+(21 in doubt), 12 of 12 caught the cluster in a joint configuration, 0
+linearizability violations found.
+```
+
+```sh
+go test ./internal/server/ \
+  -run TestLinearizabilityAcrossACrashDuringAMembershipChange \
+  -quorum.reconfig-crash -v
+```
+
+It is gated behind that flag and runs in the nightly, not in `go test ./...`.
+CI runs the ordinary suite with `-race -timeout 10m`, and five servers per
+schedule with crash-restarts under the race detector does not fit inside it
+alongside everything else: ungated, it took `internal/server` past ten minutes,
+which CI reports as a hang rather than as a failure with a message. Gated, that
+package runs in 106 s.
+
+The crash is aimed rather than timed. A membership change commits in two steps,
+and between them the cluster decides by a majority of the old voters *and* a
+majority of the new ones; a node crashing there recovers by replaying its own
+log, so which configuration it comes back believing depends on how much reached
+disk. The harness polls `Status().Config.IsJoint()` and crashes only once it is
+true, choosing a victim that votes in both configurations. An earlier draft
+crashed on a timer and hit that window in roughly one schedule in six.
+
+The 12-of-12 figure is reported by the test itself and asserted: a run that
+catches the joint window zero times fails with "this run exercised nothing the
+soak does not" rather than passing. That assertion was checked by disabling the
+joint detection and watching the test go red, because a harness that cannot fail
+is the thing §5 on this page is about.
+
+The remaining gaps are unchanged: no clock skew, no disk-level fault injection
+beyond the crash-fuzz in `internal/storage`, and no message reordering or
+duplication on the real transport.
