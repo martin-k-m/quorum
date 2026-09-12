@@ -345,15 +345,27 @@ func runGet(args []string) error {
 	if err := c.Call("Node.Get", getArgs{Key: []byte(*key)}, &reply); err != nil {
 		return err
 	}
+	if err := getError(reply); err != nil {
+		return err
+	}
+	fmt.Println(string(reply.Value))
+	return nil
+}
+
+// getError turns a Get reply into the error the user sees, or nil when Value
+// is an answer. The server sets Err exactly when Found and Value carry no
+// information, so Err is checked first; a not-found key has Err empty. The
+// hint travels alongside Err, not instead of it, so a follower's rejection
+// names the leader the same way a rejected put does.
+func getError(reply getReply) error {
 	if reply.Err != "" {
+		if reply.LeaderHint != raft.None {
+			return fmt.Errorf("get rejected: %s; current leader is node %d", reply.Err, reply.LeaderHint)
+		}
 		return fmt.Errorf("get rejected: %s", reply.Err)
 	}
 	if !reply.Found {
-		if reply.LeaderHint != 0 {
-			return fmt.Errorf("this node is not the leader; try node %d", reply.LeaderHint)
-		}
 		return fmt.Errorf("key not found")
 	}
-	fmt.Println(string(reply.Value))
 	return nil
 }
