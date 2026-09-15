@@ -133,6 +133,16 @@ type learnerReq struct {
 	resp chan confResult
 }
 
+type transferResult struct {
+	leader uint64
+	err    error
+}
+
+type transferReq struct {
+	to   uint64
+	resp chan transferResult
+}
+
 // Server is one running quorum node: a raft.Node plus everything around it.
 type Server struct {
 	cfg    Config
@@ -143,13 +153,14 @@ type Server struct {
 
 	lastApplied uint64
 
-	inbox     chan raft.Message
-	proposeCh chan proposeReq
-	getCh     chan getReq
-	confCh    chan confReq
-	learnerCh chan learnerReq
-	stopCh    chan struct{}
-	doneCh    chan struct{}
+	inbox      chan raft.Message
+	proposeCh  chan proposeReq
+	getCh      chan getReq
+	confCh     chan confReq
+	learnerCh  chan learnerReq
+	transferCh chan transferReq
+	stopCh     chan struct{}
+	doneCh     chan struct{}
 
 	listener net.Listener
 	rpcSrv   *rpc.Server
@@ -185,6 +196,10 @@ type Status struct {
 	// the previous one. Config.IsJoint() is true while a membership change is
 	// in its overlap period.
 	Config raft.Configuration
+	// Transferee is the node this leader is handing leadership to, or raft.None.
+	// Nonzero only on a leader, and only until the transfer completes or is
+	// abandoned; see TransferLeadership.
+	Transferee uint64
 }
 
 // Status returns the most recent snapshot published by the event loop. Every
@@ -202,7 +217,7 @@ func (s *Server) publishStatus() {
 		ID: s.cfg.ID, Role: s.node.Role(), Term: s.node.Term(),
 		Leader: s.node.Lead(), LastIndex: s.node.LastIndex(), Committed: s.node.Committed(),
 		SnapshotIndex: s.node.SnapshotIndex(), Applied: s.lastApplied,
-		Config: s.node.Config(), Progress: s.progress(),
+		Config: s.node.Config(), Progress: s.progress(), Transferee: s.node.Transferee(),
 	})
 }
 
@@ -268,6 +283,7 @@ func New(cfg Config) (*Server, error) {
 		getCh:       make(chan getReq),
 		confCh:      make(chan confReq),
 		learnerCh:   make(chan learnerReq),
+		transferCh:  make(chan transferReq),
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
 	}
@@ -425,6 +441,29 @@ func (s *Server) AddLearner(ids ...uint64) (index uint64, leaderHint uint64, err
 	return r.index, 0, nil
 }
 
+// TransferLeadership hands leadership to another voter without waiting for an
+// election timeout; see raft.Node.TransferLeadership for the mechanism. It
+// must be called on the leader and returns once the request is accepted, not
+// once the transfer is done: the transfer completes when the target's first
+// AppendEntries turns this node into a follower, and a caller that needs to
+// see that polls Status. While it is pending this node answers Propose and
+// Get with the target as the leader hint and nothing applied, and a transfer
+// that has not finished within one election timeout is abandoned and this node
+// resumes serving.
+//
+// This is what makes removing a leader graceful: transfer first, then remove,
+// and the cluster never spends an election timeout leaderless.
+func (s *Server) TransferLeadership(to uint64) (leaderHint uint64, err error) {
+	resp := make(chan transferResult, 1)
+	select {
+	case s.transferCh <- transferReq{to: to, resp: resp}:
+	case <-s.stopCh:
+		return 0, errors.New("server: stopped")
+	}
+	r := <-resp
+	return r.leader, r.err
+}
+
 // AddNode grows the cluster by one without the availability dip a bare
 // ChangeMembership causes.
 //
@@ -548,8 +587,7 @@ func (s *Server) loop() {
 			// optimization: the cost of a write is one disk sync, and one sync
 			// can carry as many entries as have arrived. See docs/DECISIONS.md §4.
 			batch := s.drainProposals(req)
-			if s.node.Role() != raft.Leader {
-				lead := s.node.Lead()
+			if lead, ok := s.acceptingProposals(); !ok {
 				for _, r := range batch {
 					r.resp <- proposeResult{leader: lead}
 				}
@@ -610,9 +648,17 @@ func (s *Server) loop() {
 				req.resp <- confResult{index: idx, done: applied}
 			}}
 
+		case req := <-s.transferCh:
+			// Nothing is appended and nothing is persisted: the leader only
+			// records the target and may send it entries or a TimeoutNow.
+			before := s.snapshot()
+			err := s.node.TransferLeadership(req.to)
+			s.afterStep(before)
+			req.resp <- transferResult{leader: s.node.Lead(), err: err}
+
 		case req := <-s.getCh:
-			if s.node.Role() != raft.Leader {
-				req.resp <- getResult{leader: s.node.Lead(), err: errNotLeader}
+			if lead, ok := s.acceptingProposals(); !ok {
+				req.resp <- getResult{leader: lead, err: errNotLeader}
 				continue
 			}
 			// A linearizable read barrier: propose a no-op entry (fsm.Apply
@@ -664,6 +710,23 @@ func (s *Server) loop() {
 			resolve()
 		}
 	}
+}
+
+// acceptingProposals reports whether this node will append a client entry
+// right now, and if not, who to ask instead. A follower names its leader. A
+// leader mid-transfer names the transferee: raft.Node drops a proposal for the
+// duration of a transfer, and registering a pending entry for an index that
+// never gets appended would be answered, wrongly, by whatever later lands
+// there. The hint is the node that is about to lead, which is where a client
+// that retries will end up anyway.
+func (s *Server) acceptingProposals() (leaderHint uint64, ok bool) {
+	if s.node.Role() != raft.Leader {
+		return s.node.Lead(), false
+	}
+	if to := s.node.Transferee(); to != raft.None {
+		return to, false
+	}
+	return 0, true
 }
 
 // drainProposals returns first plus every proposal already queued on the
@@ -914,6 +977,24 @@ type ChangeMembershipReply struct {
 func (f *rpcFacade) ChangeMembership(args ChangeMembershipArgs, reply *ChangeMembershipReply) error {
 	idx, leader, err := (*Server)(f).ChangeMembership(args.Voters)
 	reply.Index, reply.LeaderHint = idx, leader
+	if err != nil {
+		reply.Err = err.Error()
+	}
+	return nil
+}
+
+type TransferArgs struct{ To uint64 }
+type TransferReply struct {
+	LeaderHint uint64
+	Err        string
+}
+
+// TransferLeadership is the client-facing transfer RPC; see
+// Server.TransferLeadership. Like the other leader-only RPCs it answers a
+// follower's call with the leader in LeaderHint.
+func (f *rpcFacade) TransferLeadership(args TransferArgs, reply *TransferReply) error {
+	leader, err := (*Server)(f).TransferLeadership(args.To)
+	reply.LeaderHint = leader
 	if err != nil {
 		reply.Err = err.Error()
 	}

@@ -29,6 +29,9 @@ func (n *Node) AddLearner(ids ...uint64) (index uint64, err error) {
 	if n.ConfChangeInFlight() {
 		return 0, ErrConfChangeInProgress
 	}
+	if n.transferee != None {
+		return 0, ErrTransferInProgress
+	}
 	add := normalize(ids)
 	if len(add) == 0 {
 		return 0, ErrEmptyConfig

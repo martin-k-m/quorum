@@ -29,6 +29,12 @@
 // arrive with a wildly inflated term. Adding a node also requires the running
 // nodes to already know its address, since addressing is local configuration
 // and only membership goes through consensus.
+//
+// To take the leader out of a cluster without waiting on an election, hand
+// leadership to another voter first, then remove it:
+//
+//	quorum transfer -addr=localhost:9001 -to=2
+//	quorum members -addr=localhost:9002 -voters=2,3,4
 package main
 
 import (
@@ -65,6 +71,8 @@ func main() {
 		err = runDelete(os.Args[2:])
 	case "members":
 		err = runMembers(os.Args[2:])
+	case "transfer":
+		err = runTransfer(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -76,7 +84,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: quorum <serve|put|get|delete|members> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: quorum <serve|put|get|delete|members|transfer> [flags]")
 }
 
 // parseIDs parses a "1,2,3" voter list.
@@ -181,9 +189,10 @@ func runServe(args []string) error {
 	return nil
 }
 
-// dial connects to addr and issues a client call, following at most one
-// leader redirect hint — enough for the demo without building a smart client
-// that retries indefinitely against a cluster mid-election.
+// dial connects to addr for one client call. It follows no leader redirect
+// hint: a follower's rejection names the leader and the caller retries against
+// that node, which keeps the CLI free of a smart client that retries against
+// a cluster mid-election.
 func dial(addr string) (*rpc.Client, error) {
 	return rpc.Dial("tcp", addr)
 }
@@ -315,6 +324,45 @@ func runMembers(args []string) error {
 		return fmt.Errorf("membership change rejected: %s", reply.Err)
 	}
 	fmt.Printf("ok: configuration %v agreed at log index %d\n", target, reply.Index)
+	return nil
+}
+
+// transferArgs/transferReply mirror server.rpcFacade's TransferLeadership RPC.
+type transferArgs struct{ To uint64 }
+type transferReply struct {
+	LeaderHint uint64
+	Err        string
+}
+
+// runTransfer asks the leader to hand leadership to another voter. The call
+// returns once the leader has accepted the request, not once the target leads;
+// `quorum members` against any node shows who leads afterwards.
+func runTransfer(args []string) error {
+	fs := flag.NewFlagSet("transfer", flag.ExitOnError)
+	addr := fs.String("addr", "", "address of the current leader")
+	to := fs.Uint64("to", 0, "id of the voter to hand leadership to")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *addr == "" || *to == 0 {
+		return fmt.Errorf("transfer requires -addr and -to")
+	}
+	c, err := dial(*addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	var reply transferReply
+	if err := c.Call("Node.TransferLeadership", transferArgs{To: *to}, &reply); err != nil {
+		return err
+	}
+	if reply.Err != "" {
+		if reply.LeaderHint != raft.None {
+			return fmt.Errorf("transfer rejected: %s (current leader is node %d)", reply.Err, reply.LeaderHint)
+		}
+		return fmt.Errorf("transfer rejected: %s", reply.Err)
+	}
+	fmt.Printf("ok: transferring leadership to node %d\n", *to)
 	return nil
 }
 

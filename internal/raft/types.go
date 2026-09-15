@@ -103,6 +103,12 @@ const (
 	// answered with a MsgAppResp, because what it establishes is the same thing
 	// a MsgApp establishes: a match index the leader can replicate onward from.
 	MsgSnap
+	// MsgTimeoutNow is a leader's instruction to one follower to start an
+	// election immediately, without waiting for its own timer. It is the last
+	// step of a leadership transfer (Raft dissertation §3.10): the leader has
+	// already made sure the target's log is up to date, so the target wins
+	// the election it starts.
+	MsgTimeoutNow
 )
 
 func (t MsgType) String() string {
@@ -121,6 +127,8 @@ func (t MsgType) String() string {
 		return "AppResp"
 	case MsgSnap:
 		return "Snap"
+	case MsgTimeoutNow:
+		return "TimeoutNow"
 	default:
 		return "Unknown"
 	}

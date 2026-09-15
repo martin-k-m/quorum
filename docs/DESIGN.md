@@ -350,8 +350,9 @@ heard of it and arrive with an inflated term.
 - **~~No non-voting catch-up phase.~~** Built since. A node is added as a
   learner, replicates without counting toward any quorum, and is promoted once
   it can contribute. See [DECISIONS.md](DECISIONS.md) §8.
-- **No leadership transfer.** Removing the leader works: it steps down and
-  the survivors elect a replacement. It costs one election.
+- **~~No leadership transfer.~~** Built since. A leader hands over to a
+  chosen voter with `TimeoutNow` after catching it up, so removing a leader no
+  longer waits on an election timeout. See [DECISIONS.md](DECISIONS.md) §9.
 - **No automatic node discovery.** See §10.2.
 
 ### 10.4 `strata` as the storage backend: considered, dropped
