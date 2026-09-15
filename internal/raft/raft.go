@@ -64,6 +64,13 @@ type Node struct {
 	next  map[uint64]uint64
 	match map[uint64]uint64
 
+	// transferee is the node a leader is handing leadership to, or None. While
+	// it is set the leader refuses proposals, so the target can catch up to a
+	// log that has stopped moving; see TransferLeadership. transferElapsed
+	// bounds how long that refusal can last.
+	transferee      uint64
+	transferElapsed int
+
 	// Logical clock. Timeouts are in ticks. electionTimeout is re-randomized on
 	// each election within [base, 2*base) so simultaneous candidacies desynchronize.
 	elapsed          int
@@ -262,6 +269,7 @@ func (n *Node) Tick() {
 			n.elapsed = 0
 			n.broadcastAppend()
 		}
+		n.tickTransfer()
 	default:
 		if n.elapsed >= n.electionTimeout {
 			n.campaign()
@@ -315,6 +323,8 @@ func (n *Node) Step(m Message) {
 		n.stepAppendResp(m)
 	case MsgSnap:
 		n.stepSnap(m)
+	case MsgTimeoutNow:
+		n.stepTimeoutNow(m)
 	}
 }
 
@@ -328,6 +338,7 @@ func (n *Node) becomeFollower(term, lead uint64) {
 	n.role = Follower
 	n.lead = lead
 	n.votes = map[uint64]bool{}
+	n.transferee = None
 	n.resetElectionTimeout()
 }
 
@@ -337,12 +348,14 @@ func (n *Node) becomeCandidate() {
 	n.vote = n.id // vote for self
 	n.lead = None
 	n.votes = map[uint64]bool{n.id: true}
+	n.transferee = None
 	n.resetElectionTimeout()
 }
 
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.lead = n.id
+	n.transferee = None
 	n.next = map[uint64]uint64{}
 	n.match = map[uint64]uint64{}
 	for _, id := range n.config.Replicas() {
@@ -456,6 +469,14 @@ func (n *Node) stepPropose(m Message) {
 	if n.role != Leader {
 		return // only the leader accepts proposals; a real client would be redirected
 	}
+	if n.transferee != None {
+		// A transfer is waiting for the target to catch up to this log. Taking
+		// more entries would move the target it is chasing, so a proposal is
+		// dropped and the caller retries against the new leader. The server
+		// answers it with the transferee as the leader hint, and tickTransfer
+		// bounds how long this can go on.
+		return
+	}
 	for _, e := range m.Entries {
 		// A client proposal is always a normal entry; a membership change
 		// goes through ProposeConfChange, which has safety checks a raw
@@ -500,6 +521,9 @@ func (n *Node) ProposeConfChange(voters []uint64) (index uint64, err error) {
 	}
 	if n.ConfChangeInFlight() {
 		return 0, ErrConfChangeInProgress
+	}
+	if n.transferee != None {
+		return 0, ErrTransferInProgress
 	}
 	if n.log.term(n.log.committed) != n.term {
 		return 0, ErrLeaderNotReady
@@ -592,6 +616,9 @@ func (n *Node) stepAppendResp(m Message) {
 	n.match[m.From] = m.Match
 	n.next[m.From] = m.Match + 1
 	n.maybeCommit()
+	if m.From == n.transferee {
+		n.maybeSendTimeoutNow()
+	}
 }
 
 // maybeCommit advances the commit index to the highest N replicated on a

@@ -127,6 +127,13 @@ func (net *Network) ChangeMembership(id uint64, voters []uint64) (uint64, error)
 	return net.Nodes[id].ProposeConfChange(voters)
 }
 
+// TransferLeadership asks the node at id (expected to be the leader) to hand
+// leadership to the voter at to. It returns once the request is accepted; the
+// transfer itself plays out over the following ticks.
+func (net *Network) TransferLeadership(id, to uint64) error {
+	return net.Nodes[id].TransferLeadership(to)
+}
+
 // Config returns a node's current view of the cluster configuration.
 func (net *Network) Config(id uint64) raft.Configuration { return net.Nodes[id].Config() }
 

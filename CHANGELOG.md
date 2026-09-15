@@ -12,6 +12,15 @@ milestones are done, so it all sits under Unreleased.
 
 ### Added
 
+- **Leadership transfer** (`raft.Node.TransferLeadership`,
+  `server.Server.TransferLeadership`, `quorum transfer`). A leader hands over
+  to a chosen voter: it stops taking proposals, brings the target's log up to
+  its own, then sends it a `TimeoutNow` so the target starts an election it
+  wins. The cluster changes leader in one term with no leaderless window, which
+  is what makes removing a leader graceful. A transfer that has not finished
+  within one election timeout is abandoned and the leader resumes serving. See
+  [docs/DECISIONS.md](docs/DECISIONS.md) §9.
+
 - **Measured performance, and the evidence behind the correctness claims.**
   [docs/BENCHMARKS.md](docs/BENCHMARKS.md) records write and linearizable-read
   throughput and latency (median and p99) on 3- and 5-node clusters, the

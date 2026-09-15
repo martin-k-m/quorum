@@ -287,5 +287,45 @@ learners existed still decodes: those payloads simply end where the learner
 count would begin. A new header field would have changed the meaning of every
 byte after it, and a node replaying an older log would have panicked on it.
 
-Still not done: there is no leadership transfer, so a graceful "step down before
-I am removed" is unavailable and removing a leader still costs one election.
+Leadership transfer, which this section used to name as the next gap, is now
+built; see §9.
+
+## 9. Leadership transfer stops the log, and gives up after one election timeout
+
+Removing the leader used to cost one election: it stepped down once the
+configuration excluding it committed, and the survivors waited out an election
+timeout before one of them campaigned. `TransferLeadership` is the graceful
+version from the Raft dissertation §3.10: the leader brings the target's log up
+to its own, then sends it a `TimeoutNow`, and the target starts an election it
+wins because every voter sees a log at least as complete as its own. The
+cluster changes leader in one term with no leaderless window.
+
+**The leader refuses proposals while a transfer is pending.** The target is
+chasing the leader's last index, and a log that keeps moving is one it may never
+reach. The alternative, keeping writes flowing and sending `TimeoutNow` when the
+target is "close enough", trades a bounded pause for a target that may lose the
+election on the up-to-date check and leave the old leader in place with nothing
+to show for it. A refused proposal is answered the same way a follower answers
+one, with a leader hint, and the hint names the transferee: that is the node a
+client retrying will end up at anyway. Nothing is appended and nothing is left
+in doubt, which is what makes the refusal safe to retry without the reasoning
+[BUGS.md](BUGS.md) §4 and §5 needed for a lost-leadership error.
+
+**A transfer is abandoned after one election timeout.** An unreachable target
+must not leave the cluster with a leader that takes no writes. The bound is the
+election timeout rather than a fixed number of round trips because it is the
+same failure an ordinary election has to survive, and the leader is better
+placed to keep serving than to keep waiting. A membership change is a proposal
+too, so `ProposeConfChange` and `AddLearner` are refused for the same window.
+
+**`TimeoutNow` is obeyed only from the leader of the current term.** A former
+leader that was replaced while its `TimeoutNow` was in flight must not be able
+to pull a follower into a pointless election. There is no pre-vote or
+check-quorum in this implementation, so the target's vote request needs no
+special flag to be granted: nothing here refuses a vote because a leader was
+heard from recently.
+
+Still not done: `TransferLeadership` returns when the request is accepted, not
+when the target leads, so a caller that needs the outcome polls `Status`. And a
+leader is not transferred automatically before it removes itself; the operator
+runs `quorum transfer` first and the removal second.

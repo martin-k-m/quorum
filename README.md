@@ -136,12 +136,12 @@ done — a runnable cluster with its correctness checked, not just asserted:
   `fsync` per log entry; batching proposals into one sync takes 3 nodes from
   **728 writes/s at 1 client to 7,623 at 64**, with p50 latency falling rather
   than rising.
-- **[docs/BUGS.md](docs/BUGS.md)** — the five real defects found so far, what
+- **[docs/BUGS.md](docs/BUGS.md)** — the eight real defects found so far, what
   caught each, and the regression test that pins it.
 - **[docs/DECISIONS.md](docs/DECISIONS.md)** — the choices that had a real
-  alternative, including how log compaction and proposal batching are shaped and
-  the remaining known gaps: no lease read path, no pipelining of replication,
-  and no leadership transfer.
+  alternative, including how log compaction, proposal batching and leadership
+  transfer are shaped and the remaining known gaps: no lease read path and no
+  pipelining of replication.
 
 ### What "linearizable" and "durable" mean here, concretely
 
@@ -209,6 +209,19 @@ quorum: key not found
 A `get` is not a local read: it commits a barrier entry through the log first,
 so it costs a replication round trip and returns an error rather than a stale
 value if the node has lost its majority.
+
+To take the leader out of service without waiting on an election timeout, hand
+leadership to another voter first. The leader catches the target up and then
+tells it to start an election it is guaranteed to win, so the cluster changes
+leader in one term with no leaderless window:
+
+```sh
+$ ./quorum transfer -addr localhost:9003 -to 1
+ok: transferring leadership to node 1
+$ ./quorum members -addr localhost:9001
+voters: [1 2 3]
+this node: leader, leader: 1
+```
 
 The peer protocol is `net/rpc` over plain TCP, with no authentication and no
 TLS. Run a cluster only on a network you control; see
