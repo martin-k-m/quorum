@@ -4,11 +4,13 @@ All notable changes to quorum are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions will
 follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-Nothing is released yet. The history below is the milestone plan in
+The history below is the milestone plan in
 [docs/DESIGN.md](docs/DESIGN.md) §8 as it was actually built. All seven
-milestones are done, so it all sits under Unreleased.
+milestones are done, and they ship together as 0.1.0.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-09-16
 
 ### Added
 
@@ -141,4 +143,5 @@ Three found by building and running the M6 checker, all within that milestone:
   proposed in and resolving as success only when the entry that actually lands
   at that index still carries that term.
 
-[Unreleased]: https://github.com/martin-k-m/quorum/commits/main
+[Unreleased]: https://github.com/martin-k-m/quorum/compare/v0.1.0...main
+[0.1.0]: https://github.com/martin-k-m/quorum/releases/tag/v0.1.0
